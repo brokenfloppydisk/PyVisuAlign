@@ -1,0 +1,413 @@
+import sys
+import json
+import numpy as np
+import logging
+import argparse
+from PyQt5.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QVBoxLayout,
+    QHBoxLayout,
+    QFileDialog,
+    QPushButton,
+    QWidget,
+    QCheckBox,
+    QLabel,
+)
+from pyqtgraph import GraphicsLayoutWidget, ImageItem, PlotDataItem, ViewBox
+from scipy.spatial import Delaunay
+from PIL import Image, ImageOps
+from typing import List, Tuple, Optional
+from int32slices import Int32Slices
+
+
+class VisuAlignApp(QMainWindow):
+    def __init__(self, json_file: Optional[str] = None, debug: bool = False) -> None:
+        super().__init__()
+        self.setWindowTitle("VisuAlign Viewer")
+        self.setGeometry(100, 100, 1200, 800)
+
+        logging.basicConfig(
+            level=logging.DEBUG if debug else logging.INFO,
+            format="%(asctime)s - %(levelname)s - %(message)s",
+        )
+
+        # Main layout
+        self.central_widget: QWidget = QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.layout: QVBoxLayout = QVBoxLayout(self.central_widget)
+
+        # Control panel
+        self.control_panel: QWidget = QWidget()
+        self.control_layout: QHBoxLayout = QHBoxLayout(self.control_panel)
+        self.outline_checkbox: QCheckBox = QCheckBox("Show Region Outlines Only")
+        self.outline_checkbox.stateChanged.connect(self.toggle_outline_mode)
+        self.control_layout.addWidget(self.outline_checkbox)
+
+        # Region label display
+        self.region_label: QLabel = QLabel("Hover over atlas to see region names")
+        self.region_label.setMinimumWidth(400)
+        self.region_label.setStyleSheet("QLabel { background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc; }")
+        self.control_layout.addWidget(self.region_label)
+
+        self.control_layout.addStretch()  # Push controls to the left
+        self.layout.addWidget(self.control_panel)
+
+        self.atlas_view: GraphicsLayoutWidget = GraphicsLayoutWidget()
+        self.atlas_viewbox: ViewBox = self.atlas_view.addViewBox()
+        self.atlas_view.addLabel('Atlas View', row=0, col=0)
+        self.transformed_view: GraphicsLayoutWidget = GraphicsLayoutWidget()
+        self.brain_viewbox: ViewBox = self.transformed_view.addViewBox(row=1, col=0)
+        self.transformed_view.addLabel('Brain Image', row=0, col=0)
+        self.transformed_atlas_viewbox: ViewBox = self.transformed_view.addViewBox(row=1, col=1)
+        self.transformed_view.addLabel('Transformed Atlas', row=0, col=1)
+
+        self.layout.addWidget(self.atlas_view)
+        self.layout.addWidget(self.transformed_view)
+
+        self.slice_data: Optional[dict] = None
+        self.image: Optional[np.ndarray] = None
+        self.markers: Optional[np.ndarray] = None
+        self.anchoring: Optional[np.ndarray] = None
+        self.triangulation: Optional[Delaunay] = None
+        self.atlas_item: Optional[ImageItem] = None
+        self.transformed_image_item: Optional[ImageItem] = None
+        self.original_line: Optional[PlotDataItem] = None
+        self.transformed_line: Optional[PlotDataItem] = None
+
+        self.raw_atlas_slice: Optional[np.ndarray] = None
+        self.display_slice: Optional[np.ndarray] = None
+        self.region_labels: dict = {}  # Maps region ID to region name
+
+        self.drawing: bool = False
+        self.line_points: List[Tuple[float, float]] = []
+
+        # If no JSON file is provided, show the load button
+        if json_file:
+            self.load_data(json_file)
+        else:
+            self.load_button: QPushButton = QPushButton("Load VisuAlign JSON File")
+            self.load_button.clicked.connect(self.load_data_interactively)
+            self.layout.addWidget(self.load_button)
+
+    def load_data(self, json_file: str) -> None:
+        logging.info(f"Loading JSON file: {json_file}")
+        try:
+            with open(json_file, "r") as f:
+                data = json.load(f)
+
+            # Load the first slice (TODO: Switch between slices)
+            self.slice_data = data["slices"][0]
+            self.markers = np.array(self.slice_data["markers"])
+            self.anchoring = np.array(self.slice_data["anchoring"])
+
+            expected_width = self.slice_data["width"]
+            expected_height = self.slice_data["height"]
+            logging.debug(
+                f"Expected dimensions: width={expected_width}, height={expected_height}"
+            )
+
+            image_path = self.slice_data["filename"]
+            logging.info(f"Loading image file: {image_path}")
+
+            image: Image = Image.open(image_path)
+            image = ImageOps.exif_transpose(image)
+
+            logging.debug(
+                f"Image dimensions: width={image.width}, height={image.height}"
+            )
+            # Rotate the image if necessary (width = vertical, height = horizontal for pyqt)
+            if image.width == expected_width and image.height == expected_height:
+                pass
+                image = image.rotate(180, expand=True)
+            elif image.width == expected_height and image.height == expected_width:
+                pass
+            else:
+                logging.warning(
+                    "Unexpected image dimensions. Please verify the input files."
+                )
+
+            self.image = np.array(image.convert("L"))  # Convert to grayscale
+
+            self.perform_triangulation()
+
+            self.load_atlas("cutlas/" + data["target"] + "/labels.nii.gz")
+            self.load_region_labels("cutlas/" + data["target"] + "/labels.txt")
+
+        except Exception as e:
+            logging.error(f"Failed to load data: {e}")
+
+    def load_data_interactively(self) -> None:
+        json_path, _ = QFileDialog.getOpenFileName(
+            self, "Select JSON File", "", "JSON Files (*.json)"
+        )
+        if not json_path:
+            logging.warning("No JSON file selected.")
+            return
+
+        self.load_data(json_path)
+
+    def load_atlas(self, nifti_file: str) -> None:
+        logging.info(f"Loading NIfTI file: {nifti_file}")
+        try:
+            self.atlas = Int32Slices(nifti_file)
+            logging.info("NIfTI file loaded successfully.")
+
+        except Exception as e:
+            logging.error(f"Failed to load NIfTI file: {e}")
+
+        self.draw_atlas()
+
+    def draw_atlas(self) -> None:
+        if self.atlas is None or self.slice_data is None:
+            logging.warning("Atlas or slice data not loaded.")
+            return
+
+        slice_origin = self.slice_data["anchoring"][0:3]
+        slice_x_axis = self.slice_data["anchoring"][3:6]
+        slice_y_axis = self.slice_data["anchoring"][6:9]
+
+        logging.debug(f"Extracting atlas slice with params {(self.slice_data['anchoring'][0:9])}.")
+
+        atlas_slice = self.atlas.get_int32_slice(
+            slice_origin, slice_x_axis, slice_y_axis, grayscale=False
+        )
+
+        logging.debug(f"Atlas slice shape: {atlas_slice.shape}")
+        logging.debug(f"Atlas slice data type: {atlas_slice.dtype}")
+        logging.debug(f"Atlas slice min/max values: {atlas_slice.min()}/{atlas_slice.max()}")
+        logging.debug(f"Atlas slice unique values count: {len(np.unique(atlas_slice))}")
+        logging.debug(f"Non-zero values count: {np.count_nonzero(atlas_slice)}")
+
+        self.raw_atlas_slice = atlas_slice
+        display_slice = np.zeros_like(atlas_slice, dtype=np.float32)
+
+        # Get unique non-zero values (brain region IDs)
+        unique_labels = np.unique(atlas_slice[atlas_slice > 0])
+        logging.debug(f"Unique brain region labels: {len(unique_labels)} regions")
+
+        # Map each unique label to a display value
+        # TODO: Grab the colors from the labels.txt?
+        for i, label in enumerate(unique_labels):
+            display_value = (i + 1) * (255.0 / len(unique_labels))
+            display_slice[atlas_slice == label] = display_value
+
+        self.display_slice = display_slice
+        logging.debug(f"Display slice min/max: {display_slice.min()}/{display_slice.max()}")
+
+        self.update_atlas_display()
+        self.setup_mouse_tracking()
+        self.display_transformed_views()
+
+    def update_atlas_display(self) -> None:
+        """Update the atlas display based on current settings."""
+        if self.display_slice is None:
+            return
+
+        if self.outline_checkbox.isChecked():
+            outline_slice = self.create_region_outlines()
+            display_data = outline_slice
+        else:
+            display_data = self.display_slice
+
+        logging.debug("Updating atlas display.")
+        if self.atlas_item:
+            self.atlas_viewbox.removeItem(self.atlas_item)
+        
+        # Flip vertically to match (TODO: This is just a placeholder for now, make orientation consistent later)
+        self.atlas_item = ImageItem(image=np.fliplr(display_data.T))
+        self.atlas_viewbox.addItem(self.atlas_item)
+        self.atlas_viewbox.setAspectLocked(True)
+
+    def create_region_outlines(self) -> np.ndarray:
+        """Create an outline-only version of the atlas slice."""
+        if self.raw_atlas_slice is None:
+            return np.zeros((1, 1), dtype=np.float32)
+
+        outline_slice = np.zeros_like(self.raw_atlas_slice, dtype=np.float32)
+
+        # Detect edges by finding pixels that are different from their neighbors
+        # TODO: Do this in numpy: https://stackoverflow.com/a/29488679
+        for y in range(1, self.raw_atlas_slice.shape[0] - 1):
+            for x in range(1, self.raw_atlas_slice.shape[1] - 1):
+                current_label = self.raw_atlas_slice[y, x]
+                if current_label == 0:
+                    continue
+
+                neighbors = [
+                    self.raw_atlas_slice[y-1, x],
+                    self.raw_atlas_slice[y+1, x],
+                    self.raw_atlas_slice[y, x-1],
+                    self.raw_atlas_slice[y, x+1]
+                ]
+
+                if any(neighbor != current_label for neighbor in neighbors):
+                    outline_slice[y, x] = 255.0
+
+        return outline_slice
+
+    def toggle_outline_mode(self) -> None:
+        """Toggle between filled regions and outline-only display."""
+        self.update_atlas_display()
+
+        if not hasattr(self, 'transformed_atlas_viewbox') or self.display_slice is None:
+            return
+        
+        self.transformed_atlas_viewbox.clear()
+        transformed_atlas = self.transform_atlas()
+        transformed_atlas_item = ImageItem(image=transformed_atlas.T)
+        self.transformed_atlas_viewbox.addItem(transformed_atlas_item)
+
+    def display_transformed_views(self) -> None:
+        """Display the brain image and transformed atlas in the bottom window."""
+        if self.image is None or self.display_slice is None:
+            return
+
+        logging.debug("Displaying brain image and transformed atlas.")
+
+        # Display brain image
+        brain_image_item = ImageItem(image=self.image.T)
+        self.brain_viewbox.addItem(brain_image_item)
+        self.brain_viewbox.setAspectLocked(True)
+
+        # Create and display transformed atlas
+        transformed_atlas = self.transform_atlas()
+        transformed_atlas_item = ImageItem(image=transformed_atlas.T)
+        self.transformed_atlas_viewbox.addItem(transformed_atlas_item)
+        self.transformed_atlas_viewbox.setAspectLocked(True)
+
+    def transform_atlas(self) -> np.ndarray:
+        """Transform the atlas using the triangulation to align with the brain image."""
+        if self.display_slice is None or self.triangulation is None:
+            return np.zeros((100, 100), dtype=np.float32)
+
+        # Get the current display data (either filled or outline)
+        if self.outline_checkbox.isChecked():
+            source_data = self.create_region_outlines()
+        else:
+            source_data = self.display_slice
+
+        # Create output image with same dimensions as brain image
+        output_height, output_width = self.image.shape
+        transformed_atlas = np.zeros((output_height, output_width), dtype=np.float32)
+
+        # Transform each pixel from atlas space to brain image space
+        for y in range(source_data.shape[0]):
+            for x in range(source_data.shape[1]):
+                # Ignore background pixels
+                if source_data[y, x] == 0:
+                    continue
+
+                transformed_x, transformed_y = self.transform_point(x, y)
+
+                tx, ty = int(round(transformed_x)), int(round(transformed_y))
+
+                # Check bounds and assign pixel value
+                if (0 <= tx < output_width and 0 <= ty < output_height):
+                    transformed_atlas[ty, tx] = source_data[y, x]
+
+        return transformed_atlas
+
+    def load_region_labels(self, labels_file: str) -> None:
+        """Load brain region labels from the labels.txt file."""
+        logging.info(f"Loading region labels from: {labels_file}")
+        try:
+            with open(labels_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if (not line) or line.startswith('#'):
+                        continue
+
+                    parts = line.split('\t')
+                    if len(parts) < 8:
+                        continue
+
+                    # Parse the line: IDX -R- -G- -B- -A-- VIS MSH LABEL
+                    region_id = int(parts[0])
+                    label = parts[7].strip('"')
+                    self.region_labels[region_id] = label
+
+            logging.info(f"Loaded {len(self.region_labels)} region labels")
+
+        except Exception as e:
+            logging.error(f"Failed to load region labels: {e}")
+
+    def setup_mouse_tracking(self) -> None:
+        """Set up mouse tracking for the atlas view."""
+        if self.atlas_item is None:
+            return
+        
+        self.atlas_view.scene().sigMouseMoved.connect(self.on_mouse_move)
+
+    def on_mouse_move(self, pos) -> None:
+        """Handle mouse movement over the atlas."""
+        if self.raw_atlas_slice is None or self.atlas_item is None:
+            return
+
+        # Convert scene coordinates to image coordinates
+        if self.atlas_item.sceneBoundingRect().contains(pos):
+            item_pos = self.atlas_item.mapFromScene(pos)
+            x, y = int(item_pos.x()), int(item_pos.y())
+
+            if (0 <= x < self.raw_atlas_slice.shape[1] and 
+                0 <= y < self.raw_atlas_slice.shape[0]):
+
+                # Get the region ID at this position
+                region_id = self.raw_atlas_slice[y, x]
+
+                if region_id > 0 and region_id in self.region_labels:
+                    region_name = self.region_labels[region_id]
+                    self.region_label.setText(f"Region: {region_name} (ID: {region_id})")
+                else:
+                    self.region_label.setText("Background region")
+            else:
+                self.region_label.setText("Hover over atlas to see region names")
+        else:
+            self.region_label.setText("Hover over atlas to see region names")
+
+    def perform_triangulation(self) -> None:
+        # TODO: Should this use the original modified Delaunay from VisuAlign?
+        points = self.markers[:, 2:4]
+        self.triangulation = Delaunay(points)
+
+    def transform_point(self, x: float, y: float) -> Tuple[float, float]:
+        simplex = self.triangulation.find_simplex((x, y))
+        if simplex == -1:
+            return x, y
+
+        vertices = self.triangulation.simplices[simplex]
+        original_points = self.markers[vertices, :2]
+        transformed_points = self.markers[vertices, 2:4]
+
+        bary_coords = self.compute_barycentric_coordinates((x, y), original_points)
+
+        transformed_x = np.dot(bary_coords, transformed_points[:, 0])
+        transformed_y = np.dot(bary_coords, transformed_points[:, 1])
+        return transformed_x, transformed_y
+
+    @staticmethod
+    def compute_barycentric_coordinates(
+        point: Tuple[float, float], triangle: np.ndarray
+    ) -> np.ndarray:
+        """Compute barycentric coordinates for a point in a triangle"""
+        A = np.array(
+            [
+                [triangle[0][0], triangle[1][0], triangle[2][0]],
+                [triangle[0][1], triangle[1][1], triangle[2][1]],
+                [1, 1, 1],
+            ]
+        )
+        b = np.array([point[0], point[1], 1])
+        return np.linalg.solve(A, b)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="VisuAlign Viewer")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--json", type=str, help="Path to the JSON file")
+    args = parser.parse_args()
+
+    app = QApplication(sys.argv)
+    window = VisuAlignApp(json_file=args.json, debug=args.debug)
+    window.show()
+    sys.exit(app.exec_())
