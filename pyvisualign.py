@@ -1,8 +1,10 @@
 import sys
 import json
 import numpy as np
+import numpy.typing as npt
 import logging
 import argparse
+from typing import List, Tuple, Optional, Any, Dict
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -14,7 +16,7 @@ from PyQt5.QtWidgets import (
     QCheckBox,
     QLabel,
 )
-from pyqtgraph import GraphicsLayoutWidget, ImageItem, PlotDataItem, ViewBox
+from pyqtgraph import GraphicsLayoutWidget, GraphicsScene, ImageItem, PlotDataItem, ViewBox
 from scipy.spatial import Delaunay
 from PIL import Image, ImageOps
 from typing import List, Tuple, Optional
@@ -35,7 +37,7 @@ class VisuAlignApp(QMainWindow):
         # Main layout
         self.central_widget: QWidget = QWidget()
         self.setCentralWidget(self.central_widget)
-        self.layout: QVBoxLayout = QVBoxLayout(self.central_widget)
+        self.main_layout: QVBoxLayout = QVBoxLayout(self.central_widget)
 
         # Control panel
         self.control_panel: QWidget = QWidget()
@@ -51,7 +53,7 @@ class VisuAlignApp(QMainWindow):
         self.control_layout.addWidget(self.region_label)
 
         self.control_layout.addStretch()  # Push controls to the left
-        self.layout.addWidget(self.control_panel)
+        self.main_layout.addWidget(self.control_panel)
 
         self.atlas_view: GraphicsLayoutWidget = GraphicsLayoutWidget()
         self.atlas_viewbox: ViewBox = self.atlas_view.addViewBox()
@@ -62,10 +64,11 @@ class VisuAlignApp(QMainWindow):
         self.transformed_atlas_viewbox: ViewBox = self.transformed_view.addViewBox(row=1, col=1)
         self.transformed_view.addLabel('Transformed Atlas', row=0, col=1)
 
-        self.layout.addWidget(self.atlas_view)
-        self.layout.addWidget(self.transformed_view)
+        self.main_layout.addWidget(self.atlas_view)
+        self.main_layout.addWidget(self.transformed_view)
 
-        self.slice_data: Optional[dict] = None
+        self.slice_index: int = 0
+        self.slice_data: List = []
         self.image: Optional[np.ndarray] = None
         self.markers: Optional[np.ndarray] = None
         self.anchoring: Optional[np.ndarray] = None
@@ -88,13 +91,17 @@ class VisuAlignApp(QMainWindow):
         else:
             self.load_button: QPushButton = QPushButton("Load VisuAlign JSON File")
             self.load_button.clicked.connect(self.load_data_interactively)
-            self.layout.addWidget(self.load_button)
+            self.main_layout.addWidget(self.load_button)
 
     def load_data(self, json_file: str) -> None:
         logging.info(f"Loading JSON file: {json_file}")
         try:
             with open(json_file, "r") as f:
                 data = json.load(f)
+
+            if data["slices"][0] is None:
+                logging.error("No slices found!")
+                return
 
             # Load the first slice (TODO: Switch between slices)
             self.slice_data = data["slices"][0]
@@ -110,7 +117,7 @@ class VisuAlignApp(QMainWindow):
             image_path = self.slice_data["filename"]
             logging.info(f"Loading image file: {image_path}")
 
-            image: Image = Image.open(image_path)
+            image = Image.open(image_path)
             image = ImageOps.exif_transpose(image)
 
             logging.debug(
@@ -219,30 +226,33 @@ class VisuAlignApp(QMainWindow):
         self.atlas_viewbox.addItem(self.atlas_item)
         self.atlas_viewbox.setAspectLocked(True)
 
-    def create_region_outlines(self) -> np.ndarray:
+    def create_region_outlines(self) -> npt.NDArray[np.float32]:
         """Create an outline-only version of the atlas slice."""
         if self.raw_atlas_slice is None:
             return np.zeros((1, 1), dtype=np.float32)
 
         outline_slice = np.zeros_like(self.raw_atlas_slice, dtype=np.float32)
 
-        # Detect edges by finding pixels that are different from their neighbors
-        # TODO: Do this in numpy: https://stackoverflow.com/a/29488679
-        for y in range(1, self.raw_atlas_slice.shape[0] - 1):
-            for x in range(1, self.raw_atlas_slice.shape[1] - 1):
-                current_label = self.raw_atlas_slice[y, x]
-                if current_label == 0:
-                    continue
-
-                neighbors = [
-                    self.raw_atlas_slice[y-1, x],
-                    self.raw_atlas_slice[y+1, x],
-                    self.raw_atlas_slice[y, x-1],
-                    self.raw_atlas_slice[y, x+1]
-                ]
-
-                if any(neighbor != current_label for neighbor in neighbors):
-                    outline_slice[y, x] = 255.0
+        # Detect edges using numpy array operations
+        # Based on: https://stackoverflow.com/a/29488679
+        
+        north = self.raw_atlas_slice[:-2, 1:-1]
+        south = self.raw_atlas_slice[2:, 1:-1]
+        west = self.raw_atlas_slice[1:-1, :-2]
+        east = self.raw_atlas_slice[1:-1, 2:]
+        
+        center = self.raw_atlas_slice[1:-1, 1:-1]
+        
+        is_outline = (
+            (center != north) |
+            (center != south) |
+            (center != west) |
+            (center != east)
+        )
+        
+        is_not_background = center != 0
+        outline_mask = is_outline & is_not_background
+        outline_slice[1:-1, 1:-1][outline_mask] = 255.0
 
         return outline_slice
 
@@ -276,18 +286,16 @@ class VisuAlignApp(QMainWindow):
         self.transformed_atlas_viewbox.addItem(transformed_atlas_item)
         self.transformed_atlas_viewbox.setAspectLocked(True)
 
-    def transform_atlas(self) -> np.ndarray:
+    def transform_atlas(self) -> npt.NDArray[np.float32]:
         """Transform the atlas using the triangulation to align with the brain image."""
-        if self.display_slice is None or self.triangulation is None:
+        if self.display_slice is None or self.triangulation is None or self.image is None:
             return np.zeros((100, 100), dtype=np.float32)
 
-        # Get the current display data (either filled or outline)
         if self.outline_checkbox.isChecked():
             source_data = self.create_region_outlines()
         else:
             source_data = self.display_slice
 
-        # Create output image with same dimensions as brain image
         output_height, output_width = self.image.shape
         transformed_atlas = np.zeros((output_height, output_width), dtype=np.float32)
 
@@ -337,9 +345,11 @@ class VisuAlignApp(QMainWindow):
         if self.atlas_item is None:
             return
         
-        self.atlas_view.scene().sigMouseMoved.connect(self.on_mouse_move)
+        scene = self.atlas_view.scene()
+        if scene:
+            scene.sigMouseMoved.connect(self.on_mouse_move)  # type: ignore
 
-    def on_mouse_move(self, pos) -> None:
+    def on_mouse_move(self, pos: Any) -> None:
         """Handle mouse movement over the atlas."""
         if self.raw_atlas_slice is None or self.atlas_item is None:
             return
@@ -366,11 +376,16 @@ class VisuAlignApp(QMainWindow):
             self.region_label.setText("Hover over atlas to see region names")
 
     def perform_triangulation(self) -> None:
+        if self.markers is None:
+            return
         # TODO: Should this use the original modified Delaunay from VisuAlign?
         points = self.markers[:, 2:4]
         self.triangulation = Delaunay(points)
 
     def transform_point(self, x: float, y: float) -> Tuple[float, float]:
+        if self.triangulation is None or self.markers is None:
+            return x, y
+
         simplex = self.triangulation.find_simplex((x, y))
         if simplex == -1:
             return x, y
@@ -387,8 +402,8 @@ class VisuAlignApp(QMainWindow):
 
     @staticmethod
     def compute_barycentric_coordinates(
-        point: Tuple[float, float], triangle: np.ndarray
-    ) -> np.ndarray:
+        point: Tuple[float, float], triangle: npt.NDArray[np.float64]
+    ) -> npt.NDArray[np.float64]:
         """Compute barycentric coordinates for a point in a triangle"""
         A = np.array(
             [
