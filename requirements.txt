@@ -1,0 +1,6 @@
+numpy
+nibabel
+pillow
+PyQt5
+pyqtgraph
+scipy
