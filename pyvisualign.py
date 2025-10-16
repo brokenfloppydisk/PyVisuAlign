@@ -5,6 +5,8 @@ import numpy.typing as npt
 import logging
 import argparse
 from typing import List, Tuple, Optional, Any, Dict
+from jsonschema import ValidationError
+from project_data import load_visualign_project, VisualignSlice
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -16,6 +18,7 @@ from PyQt5.QtWidgets import (
     QCheckBox,
     QLabel,
 )
+import os.path
 from pyqtgraph import GraphicsLayoutWidget, GraphicsScene, ImageItem, PlotDataItem, ViewBox
 from scipy.spatial import Delaunay
 from PIL import Image, ImageOps
@@ -68,7 +71,7 @@ class VisuAlignApp(QMainWindow):
         self.main_layout.addWidget(self.transformed_view)
 
         self.slice_index: int = 0
-        self.slice_data: List = []
+        self.slice_data: Optional[VisualignSlice] = None
         self.image: Optional[np.ndarray] = None
         self.markers: Optional[np.ndarray] = None
         self.anchoring: Optional[np.ndarray] = None
@@ -78,8 +81,8 @@ class VisuAlignApp(QMainWindow):
         self.original_line: Optional[PlotDataItem] = None
         self.transformed_line: Optional[PlotDataItem] = None
 
-        self.raw_atlas_slice: Optional[np.ndarray] = None
-        self.display_slice: Optional[np.ndarray] = None
+        self.raw_atlas_slice: Optional[npt.NDArray[np.int32]] = None
+        self.display_slice: Optional[npt.NDArray[np.float64]] = None
         self.region_labels: dict = {}  # Maps region ID to region name
 
         self.drawing: bool = False
@@ -99,12 +102,14 @@ class VisuAlignApp(QMainWindow):
             with open(json_file, "r") as f:
                 data = json.load(f)
 
-            if data["slices"][0] is None:
-                logging.error("No slices found!")
+            try:
+                project = load_visualign_project(data)
+            except ValidationError as ve:
+                logging.error(f"Invalid JSON structure: {ve.message}")
                 return
 
             # Load the first slice (TODO: Switch between slices)
-            self.slice_data = data["slices"][0]
+            self.slice_data = project["slices"][0]
             self.markers = np.array(self.slice_data["markers"])
             self.anchoring = np.array(self.slice_data["anchoring"])
 
@@ -114,7 +119,7 @@ class VisuAlignApp(QMainWindow):
                 f"Expected dimensions: width={expected_width}, height={expected_height}"
             )
 
-            image_path = self.slice_data["filename"]
+            image_path = os.path.dirname(json_file) + "/" + self.slice_data["filename"]
             logging.info(f"Loading image file: {image_path}")
 
             image = Image.open(image_path)
@@ -138,8 +143,9 @@ class VisuAlignApp(QMainWindow):
 
             self.perform_triangulation()
 
-            self.load_atlas("cutlas/" + data["target"] + "/labels.nii.gz")
-            self.load_region_labels("cutlas/" + data["target"] + "/labels.txt")
+            # use validated project for top-level fields
+            self.load_atlas("cutlas/" + project["target"] + "/labels.nii.gz")
+            self.load_region_labels("cutlas/" + project["target"] + "/labels.txt")
 
         except Exception as e:
             logging.error(f"Failed to load data: {e}")
@@ -187,14 +193,14 @@ class VisuAlignApp(QMainWindow):
         logging.debug(f"Non-zero values count: {np.count_nonzero(atlas_slice)}")
 
         self.raw_atlas_slice = atlas_slice
-        display_slice = np.zeros_like(atlas_slice, dtype=np.float32)
+        display_slice = np.zeros_like(atlas_slice, dtype=np.float64)
 
         # Get unique non-zero values (brain region IDs)
         unique_labels = np.unique(atlas_slice[atlas_slice > 0])
         logging.debug(f"Unique brain region labels: {len(unique_labels)} regions")
 
         # Map each unique label to a display value
-        # TODO: Grab the colors from the labels.txt?
+        # TODO: Grab the colors from the labels.txt? - can use itk library to parse
         for i, label in enumerate(unique_labels):
             display_value = (i + 1) * (255.0 / len(unique_labels))
             display_slice[atlas_slice == label] = display_value
@@ -221,17 +227,18 @@ class VisuAlignApp(QMainWindow):
         if self.atlas_item:
             self.atlas_viewbox.removeItem(self.atlas_item)
         
-        # Flip vertically to match (TODO: This is just a placeholder for now, make orientation consistent later)
-        self.atlas_item = ImageItem(image=np.fliplr(display_data.T))
+        # # Flip vertically to match (TODO: This is just a placeholder for now, make orientation consistent later)
+        # self.atlas_item = ImageItem(image=np.fliplr(display_data.T))
+        self.atlas_item = ImageItem(display_data.T)
         self.atlas_viewbox.addItem(self.atlas_item)
         self.atlas_viewbox.setAspectLocked(True)
 
-    def create_region_outlines(self) -> npt.NDArray[np.float32]:
+    def create_region_outlines(self) -> npt.NDArray[np.int32]:
         """Create an outline-only version of the atlas slice."""
         if self.raw_atlas_slice is None:
-            return np.zeros((1, 1), dtype=np.float32)
+            return np.zeros((1, 1), dtype=np.int32)
 
-        outline_slice = np.zeros_like(self.raw_atlas_slice, dtype=np.float32)
+        outline_slice = np.zeros_like(self.raw_atlas_slice, dtype=np.int32)
 
         # Detect edges using numpy array operations
         # Based on: https://stackoverflow.com/a/29488679
@@ -286,10 +293,10 @@ class VisuAlignApp(QMainWindow):
         self.transformed_atlas_viewbox.addItem(transformed_atlas_item)
         self.transformed_atlas_viewbox.setAspectLocked(True)
 
-    def transform_atlas(self) -> npt.NDArray[np.float32]:
+    def transform_atlas(self) -> npt.NDArray[np.float64]:
         """Transform the atlas using the triangulation to align with the brain image."""
         if self.display_slice is None or self.triangulation is None or self.image is None:
-            return np.zeros((100, 100), dtype=np.float32)
+            return np.zeros((100, 100), dtype=np.float64)
 
         if self.outline_checkbox.isChecked():
             source_data = self.create_region_outlines()
@@ -297,9 +304,10 @@ class VisuAlignApp(QMainWindow):
             source_data = self.display_slice
 
         output_height, output_width = self.image.shape
-        transformed_atlas = np.zeros((output_height, output_width), dtype=np.float32)
+        transformed_atlas = np.zeros((output_height, output_width), dtype=np.float64)
 
         # Transform each pixel from atlas space to brain image space
+        # TODO: optimize with vectorized operations instead of iteration
         for y in range(source_data.shape[0]):
             for x in range(source_data.shape[1]):
                 # Ignore background pixels

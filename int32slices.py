@@ -43,44 +43,44 @@ class Int32Slices:
 
     def get_int32_slice(
         self,
-        origin: Tuple[int, int ,int],
-        horizontal_axis: Tuple[int, int, int],
-        vertical_axis: Tuple[int, int, int],
+        origin: npt.ArrayLike,
+        horizontal_axis: npt.ArrayLike,
+        vertical_axis: npt.ArrayLike,
         grayscale: bool = True
     ) -> npt.NDArray[np.int32]:
         """
         Extract a 2D slice from the 3D atlas volume.
-        - ox, oy, oz: slice origin
-        - ux, uy, uz: horizontal axis vector
-        - vx, vy, vz: vertical axis vector
+        - origin: 3-vector (ox, oy, oz) in voxel coordinates
+        - horizontal_axis: 3-vector (ux, uy, uz) extent along slice X
+        - vertical_axis: 3-vector (vx, vy, vz) extent along slice Y
         - grayscale: if True, normalize to 0-65535
-
-        Based on int32slices.java from VisuAlign.
         """
+        o = np.asarray(origin, dtype=np.float64)
+        u = np.asarray(horizontal_axis, dtype=np.float64)
+        v = np.asarray(vertical_axis, dtype=np.float64)
 
-        ox, oy, oz = origin
-        ux, uy, uz = horizontal_axis
-        vx, vy, vz = vertical_axis
+        # Special case scaling for _10um cutlas
+        if self.blob10 is not None:
+            scale = 2.5
+            o = o * scale
+            u = u * scale
+            v = v * scale
+        
+        width = max(1, int(np.ceil(np.linalg.norm(u))))
+        height = max(1, int(np.ceil(np.linalg.norm(v))))
 
-        # Adjust for _10um n
-        scale = 2.5 if self.blob10 is not None else 1.0
-        ox, oy, oz = ox * scale, oy * scale, oz * scale
-        ux, uy, uz = ux * scale, uy * scale, uz * scale
-        vx, vy, vz = vx * scale, vy * scale, vz * scale
-
-        width = int(np.sqrt(ux * ux + uy * uy + uz * uz)) + 1
-        height = int(np.sqrt(vx * vx + vy * vy + vz * vz)) + 1
         slice_arr = np.zeros((height, width), dtype=np.int32)
 
-        # Create coordinate grid for the slice
+        # Normalized coordinates in [0,1] across the extents (handle 1-pixel degenerate cases)
         y_coords, x_coords = np.mgrid[0:height, 0:width]
-        y_ratio = y_coords / height
-        x_ratio = x_coords / width
+        scaled_y_coords = y_coords / height
+        scaled_x_coords = x_coords / width
 
-        lx = (ox + (vx * y_ratio) + (ux * x_ratio)).astype(np.int32)
-        ly = (oy + (vy * y_ratio) + (uy * x_ratio)).astype(np.int32)
-        lz = (oz + (vz * y_ratio) + (uz * x_ratio)).astype(np.int32)
+        lx = (o[0] + (v[0] * scaled_y_coords) + (u[0] * scaled_x_coords)).astype(np.int32)
+        ly = (o[1] + (v[1] * scaled_y_coords) + (u[1] * scaled_x_coords)).astype(np.int32)
+        lz = (o[2] + (v[2] * scaled_y_coords) + (u[2] * scaled_x_coords)).astype(np.int32)
 
+        # In-bounds mask
         mask = (
             (lx >= 0) & (lx < self.XDIM) &
             (ly >= 0) & (ly < self.YDIM) &

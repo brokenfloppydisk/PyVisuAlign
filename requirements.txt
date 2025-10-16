@@ -4,3 +4,4 @@ pillow
 PyQt5
 pyqtgraph
 scipy
+jsonschema
