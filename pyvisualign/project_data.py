@@ -13,7 +13,6 @@ class VisualignProject(TypedDict):
     target: str
     slices: List[VisualignSlice]
 
-# JSON schema matching VisuAlign exports
 visualign_schema: Dict[str, Any] = {
     "type": "object",
     "required": ["target", "slices"],
@@ -42,6 +41,7 @@ visualign_schema: Dict[str, Any] = {
                         "minItems": 9,
                         "items": {"type": "number"}
                     },
+                    # TODO: Markers might actually be empty, make this optional and leave the slice unscaled
                     "markers": {
                         "type": "array",
                         "items": {
@@ -65,5 +65,4 @@ def load_visualign_project(data: Dict[str, Any]) -> VisualignProject:
     Raises jsonschema.ValidationError on failure.
     """
     validate(instance=data, schema=visualign_schema)
-    # Return as the TypedDict type (cast for static type checkers)
     return cast(VisualignProject, data)
