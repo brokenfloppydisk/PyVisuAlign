@@ -51,7 +51,7 @@ class VisuAlignApp(QMainWindow):
 
         # grayscale toggle checkbox
         self.grayscale_checkbox: QCheckBox = QCheckBox("Grayscale Image")
-        self.grayscale_checkbox.setChecked(True)
+        self.grayscale_checkbox.setChecked(False)
         self.grayscale_checkbox.stateChanged.connect(self.toggle_grayscale)
         self.control_layout.addWidget(self.grayscale_checkbox)
 
@@ -149,8 +149,8 @@ class VisuAlignApp(QMainWindow):
                 )
 
             # Keep both color (RGB) and grayscale versions; display based on checkbox
-            self.color_image = np.array(image.convert("RGB"))
-            self.gray_image = np.array(image.convert("L"))
+            self.color_image = np.fliplr(np.array(image.convert("RGB")))
+            self.gray_image = np.fliplr(np.array(image.convert("L")))
             self.image = self.gray_image if self.grayscale_checkbox.isChecked() else self.color_image
 
             self.perform_triangulation()
@@ -204,6 +204,7 @@ class VisuAlignApp(QMainWindow):
         logging.debug(f"Atlas slice unique values count: {len(np.unique(atlas_slice))}")
         logging.debug(f"Non-zero values count: {np.count_nonzero(atlas_slice)}")
 
+        atlas_slice = np.flipud(atlas_slice)
         self.raw_atlas_slice = atlas_slice
         display_slice = np.zeros_like(atlas_slice, dtype=np.float64)
 
@@ -239,8 +240,7 @@ class VisuAlignApp(QMainWindow):
         if self.atlas_item:
             self.atlas_viewbox.removeItem(self.atlas_item)
         
-        # # Flip vertically to match (TODO: This is just a placeholder for now, make orientation consistent later)
-        # self.atlas_item = ImageItem(image=np.fliplr(display_data.T))
+        # self.atlas_item = ImageItem(np.flipud(display_data.T))
         self.atlas_item = ImageItem(display_data.T)
         self.atlas_viewbox.addItem(self.atlas_item)
         self.atlas_viewbox.setAspectLocked(True)
@@ -284,6 +284,7 @@ class VisuAlignApp(QMainWindow):
         
         self.transformed_atlas_viewbox.clear()
         transformed_atlas = self.transform_atlas()
+        # transformed_atlas_item = ImageItem(image=np.flipud(transformed_atlas.T))
         transformed_atlas_item = ImageItem(image=transformed_atlas.T)
         self.transformed_atlas_viewbox.addItem(transformed_atlas_item)
 
@@ -404,13 +405,12 @@ class VisuAlignApp(QMainWindow):
         # Convert scene coordinates to image coordinates
         if self.atlas_item.sceneBoundingRect().contains(pos):
             item_pos = self.atlas_item.mapFromScene(pos)
-            x, y = int(item_pos.x()), int(item_pos.y())
+            x_disp, y_disp = int(item_pos.x()), int(item_pos.y())
+            raw_h, raw_w = self.raw_atlas_slice.shape
 
-            if (0 <= x < self.raw_atlas_slice.shape[1] and 
-                0 <= y < self.raw_atlas_slice.shape[0]):
-
+            if (0 <= x_disp < raw_h and 0 <= y_disp < raw_w):
                 # Get the region ID at this position
-                region_id = self.raw_atlas_slice[y, x]
+                region_id = self.raw_atlas_slice[y_disp, x_disp]
 
                 if region_id > 0 and region_id in self.region_labels:
                     region_name = self.region_labels[region_id]
