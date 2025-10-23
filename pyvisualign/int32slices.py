@@ -2,8 +2,6 @@ import gzip
 import numpy as np
 import numpy.typing as npt
 import nibabel as nib
-from typing import Tuple, Optional
-
 
 class Int32Slices:
     """Class to extract 2D slices from a 3D NIfTI volume as int32 arrays. 
