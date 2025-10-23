@@ -49,6 +49,12 @@ class VisuAlignApp(QMainWindow):
         self.outline_checkbox.stateChanged.connect(self.toggle_outline_mode)
         self.control_layout.addWidget(self.outline_checkbox)
 
+        # grayscale toggle checkbox
+        self.grayscale_checkbox: QCheckBox = QCheckBox("Grayscale Image")
+        self.grayscale_checkbox.setChecked(True)
+        self.grayscale_checkbox.stateChanged.connect(self.toggle_grayscale)
+        self.control_layout.addWidget(self.grayscale_checkbox)
+
         # Region label display
         self.region_label: QLabel = QLabel("Hover over atlas to see region names")
         self.region_label.setMinimumWidth(400)
@@ -73,6 +79,9 @@ class VisuAlignApp(QMainWindow):
         self.slice_index: int = 0
         self.slice_data: Optional[VisualignSlice] = None
         self.image: Optional[np.ndarray] = None
+        # Keep both color and grayscale copies of the loaded image
+        self.color_image: Optional[np.ndarray] = None
+        self.gray_image: Optional[np.ndarray] = None
         self.markers: Optional[np.ndarray] = None
         self.anchoring: Optional[np.ndarray] = None
         self.triangulation: Optional[Delaunay] = None
@@ -139,7 +148,10 @@ class VisuAlignApp(QMainWindow):
                     "Unexpected image dimensions. Please verify the input files."
                 )
 
-            self.image = np.array(image.convert("L"))  # Convert to grayscale
+            # Keep both color (RGB) and grayscale versions; display based on checkbox
+            self.color_image = np.array(image.convert("RGB"))
+            self.gray_image = np.array(image.convert("L"))
+            self.image = self.gray_image if self.grayscale_checkbox.isChecked() else self.color_image
 
             self.perform_triangulation()
 
@@ -275,6 +287,15 @@ class VisuAlignApp(QMainWindow):
         transformed_atlas_item = ImageItem(image=transformed_atlas.T)
         self.transformed_atlas_viewbox.addItem(transformed_atlas_item)
 
+    def toggle_grayscale(self) -> None:
+        """Toggle whether the brain image is shown in grayscale or color."""
+        if self.color_image is None or self.gray_image is None:
+            return
+        self.image = self.gray_image if self.grayscale_checkbox.isChecked() else self.color_image
+        # Refresh the views
+        self.update_atlas_display()
+        self.display_transformed_views()
+
     def display_transformed_views(self) -> None:
         """Display the brain image and transformed atlas in the bottom window."""
         if self.image is None or self.display_slice is None:
@@ -282,8 +303,25 @@ class VisuAlignApp(QMainWindow):
 
         logging.debug("Displaying brain image and transformed atlas.")
 
+        # Clear previous items to avoid stacking multiple items
+        try:
+            self.brain_viewbox.clear()
+        except Exception:
+            pass
+        try:
+            self.transformed_atlas_viewbox.clear()
+        except Exception:
+            pass
+
+        if self.image.ndim == 2:
+            brain_image_for_item = self.image.T
+        elif self.image.ndim == 3: # colored image
+            brain_image_for_item = np.transpose(self.image, (1, 0, 2))
+        else:
+            brain_image_for_item = self.image.T
+
         # Display brain image
-        brain_image_item = ImageItem(image=self.image.T)
+        brain_image_item = ImageItem(image=brain_image_for_item)
         self.brain_viewbox.addItem(brain_image_item)
         self.brain_viewbox.setAspectLocked(True)
 
@@ -303,7 +341,8 @@ class VisuAlignApp(QMainWindow):
         else:
             source_data = self.display_slice
 
-        output_height, output_width = self.image.shape
+        # Support color images: take height/width from first two dims
+        output_height, output_width = self.image.shape[:2]
         transformed_atlas = np.zeros((output_height, output_width), dtype=np.float64)
 
         # Transform each pixel from atlas space to brain image space
