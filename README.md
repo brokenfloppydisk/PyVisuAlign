@@ -25,7 +25,7 @@ For information about VisuAlign, see the [QUINT workflow documentation](https://
 
 3. Run the application:
    ```sh
-   python3 pyvisualign.py
+   python3 main.py
    ```
    In the app choose "Load VisuAlign JSON File" and select the project's `.json`.
 
@@ -64,7 +64,7 @@ Cutlas files can be obtained from an installation of QuickNii or VisuAlign.
 To start the app, run:
 
 ```sh
-python3 pyvisualign.py
+python3 main.py
 ```
 
 Then select "Load VisuAlign JSON File". Navigate to a VisuAlign project, and select the corresponding `.json` file.
