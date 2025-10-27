@@ -3,8 +3,10 @@ import json
 import numpy as np
 import logging
 import argparse
-from typing import Optional
-from jsonschema import ValidationError
+
+from typing import Optional, Tuple
+from enum import Enum
+
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -16,19 +18,28 @@ from PyQt5.QtWidgets import (
     QCheckBox,
     QLabel,
     QSlider,
+    QLineEdit,
+    QComboBox,
 )
 from PyQt5.QtCore import QPointF, Qt
-from pyqtgraph import GraphicsLayoutWidget, ImageItem, ViewBox
+from PyQt5.QtGui import QDoubleValidator
+from pyqtgraph import GraphicsLayoutWidget, ImageItem, ViewBox, PlotDataItem
 
 from pyvisualign.project_data import load_visualign_project, VisualignProject
 from pyvisualign.int32slices import Int32Slices
 from pyvisualign.slice import Slice
+from pyvisualign.measurement import Measurement
 
+class MeasurementMode(Enum):
+    NONE = 0
+    REFERENCE = 1
+    DRAW = 2
+    ERASE = 3
 
 class VisuAlignApp(QMainWindow):
     def __init__(self, json_file: Optional[str] = None, debug: bool = False) -> None:
         super().__init__()
-        self.setWindowTitle("VisuAlign Viewer")
+        self.setWindowTitle("PyVisuAlign")
         self.setGeometry(100, 100, 1200, 800)
 
         logging.basicConfig(
@@ -43,41 +54,144 @@ class VisuAlignApp(QMainWindow):
         self.control_panel: QWidget = QWidget()
         self.control_layout: QHBoxLayout = QHBoxLayout(self.control_panel)
         
+        opacity_grayscale_widget = QWidget()
+        opacity_grayscale_layout = QVBoxLayout(opacity_grayscale_widget)
+        opacity_grayscale_layout.setContentsMargins(0, 0, 0, 0)
+        opacity_grayscale_layout.setSpacing(2)
+        
+        opacity_widget = QWidget()
+        opacity_hlayout = QHBoxLayout(opacity_widget)
+        opacity_hlayout.setContentsMargins(0, 0, 0, 0)
+        opacity_hlayout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         opacity_label = QLabel("Atlas Opacity:")
-        self.control_layout.addWidget(opacity_label)
+        opacity_hlayout.addWidget(opacity_label)
         self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
         self.opacity_slider.setMinimum(0)
         self.opacity_slider.setMaximum(10)
         self.opacity_slider.setValue(5)
-        self.opacity_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.opacity_slider.setTickPosition(QSlider.TickPosition.NoTicks)
         self.opacity_slider.setTickInterval(1)
         self.opacity_slider.valueChanged.connect(self.update_opacity)
-        self.control_layout.addWidget(self.opacity_slider)
+        opacity_hlayout.addWidget(self.opacity_slider, alignment=Qt.AlignmentFlag.AlignBottom)
         
         self.grayscale_checkbox: QCheckBox = QCheckBox("Grayscale Image")
         self.grayscale_checkbox.setChecked(False)
         self.grayscale_checkbox.stateChanged.connect(self.toggle_grayscale)
-        self.control_layout.addWidget(self.grayscale_checkbox)
+        
+        opacity_grayscale_layout.addWidget(opacity_widget)
+        opacity_grayscale_layout.addWidget(self.grayscale_checkbox)
+        self.control_layout.addWidget(opacity_grayscale_widget)
 
-        self.region_label: QLabel = QLabel("Hover over atlas to see region names")
-        self.region_label.setMinimumWidth(400)
-        self.region_label.setStyleSheet("QLabel { background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc; }")
-        self.control_layout.addWidget(self.region_label)
+        info_widget = QWidget()
+        info_layout = QVBoxLayout(info_widget)
+        info_layout.setContentsMargins(0, 0, 0, 0)
+        info_layout.setSpacing(2)
+        
+        self.info_label: QLabel = QLabel("Select a JSON file to load")
+        self.info_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.info_label.setMinimumWidth(400)
+        self.info_label.setStyleSheet("QLabel { background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc; }")
+        info_layout.addWidget(self.info_label)
+        
+        self.atlas_info_label: QLabel = QLabel("Atlas: Unknown")
+        self.atlas_info_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.atlas_info_label.setMinimumWidth(400)
+        self.atlas_info_label.setStyleSheet("QLabel { background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc; }")
+        info_layout.addWidget(self.atlas_info_label)
+        
+        self.control_layout.addWidget(info_widget)
+        self.control_layout.addStretch()
+        
+        # Measurement controls
+        measurement_widget = QWidget()
+        measurement_layout = QVBoxLayout(measurement_widget)
+        measurement_layout.setContentsMargins(0, 0, 0, 0)
+        measurement_layout.setSpacing(2)
+        
+        measurement_top_widget = QWidget()
+        measurement_top_layout = QHBoxLayout(measurement_top_widget)
+        measurement_top_layout.setContentsMargins(0, 0, 0, 0)
+        measurement_top_layout.setSpacing(5)
+        
+        measurement_label = QLabel("Ref. Size:")
+        measurement_top_layout.addWidget(measurement_label)
+        
+        self.reference_size_input = QLineEdit()
+        self.reference_size_input.setText("1")
+        self.reference_size_input.setMaximumWidth(80)
+        self.reference_size_input.setValidator(QDoubleValidator(0.0, 1e9, 2))
+        measurement_top_layout.addWidget(self.reference_size_input)
+        
+        self.unit_selector = QComboBox()
+        self.unit_selector.addItems(["μm", "mm", "cm", "m", "px"])
+        self.unit_selector.setCurrentIndex(1)
+        self.unit_selector.setMaximumWidth(60)
+        self.unit_selector.currentTextChanged.connect(self.on_unit_changed)
+        measurement_top_layout.addWidget(self.unit_selector)
+        
+        measurement_bottom_widget = QWidget()
+        measurement_bottom_layout = QHBoxLayout(measurement_bottom_widget)
+        measurement_bottom_layout.setContentsMargins(0, 0, 0, 0)
+        measurement_bottom_layout.setSpacing(5)
+        
+        self.set_reference_button = QPushButton("📏")
+        self.set_reference_button.setToolTip("Draw reference line")
+        self.set_reference_button.setMaximumWidth(40)
+        self.set_reference_button.setCheckable(True)
+        self.set_reference_button.setEnabled(False)
+        self.set_reference_button.clicked.connect(self.toggle_reference_mode)
+        measurement_bottom_layout.addWidget(self.set_reference_button)
+        
+        self.draw_measure_button = QPushButton("✏️")
+        self.draw_measure_button.setToolTip("Draw measurement lines")
+        self.draw_measure_button.setMaximumWidth(40)
+        self.draw_measure_button.setCheckable(True)
+        self.draw_measure_button.setEnabled(False)
+        self.draw_measure_button.clicked.connect(self.toggle_draw_mode)
+        measurement_bottom_layout.addWidget(self.draw_measure_button)
+        
+        self.erase_measure_button = QPushButton("🗑️")
+        self.erase_measure_button.setToolTip("Erase measurement lines")
+        self.erase_measure_button.setMaximumWidth(40)
+        self.erase_measure_button.setCheckable(True)
+        self.erase_measure_button.setEnabled(False)
+        self.erase_measure_button.clicked.connect(self.toggle_erase_mode)
+        measurement_bottom_layout.addWidget(self.erase_measure_button)
+        
+        measurement_layout.addWidget(measurement_top_widget)
+        measurement_layout.addWidget(measurement_bottom_widget)
+        self.control_layout.addWidget(measurement_widget)
 
         self.control_layout.addStretch()
+        
+        # Slice navigation controls
+        slice_nav_widget = QWidget()
+        slice_nav_layout = QVBoxLayout(slice_nav_widget)
+        slice_nav_layout.setContentsMargins(0, 0, 0, 0)
+        slice_nav_layout.setSpacing(2)
+
+        self.slice_label: QLabel = QLabel("Slice: -")
+        self.slice_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        slice_buttons_widget = QWidget()
+        slice_buttons_layout = QHBoxLayout(slice_buttons_widget)
+        slice_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        slice_buttons_layout.setSpacing(5)
         
         self.prev_slice_button: QPushButton = QPushButton("◀ Previous Slice")
         self.prev_slice_button.clicked.connect(self.previous_slice)
         self.prev_slice_button.setEnabled(False)
-        self.control_layout.addWidget(self.prev_slice_button)
-        
-        self.slice_label: QLabel = QLabel("Slice: -")
-        self.control_layout.addWidget(self.slice_label)
+        slice_buttons_layout.addWidget(self.prev_slice_button)
         
         self.next_slice_button: QPushButton = QPushButton("Next Slice ▶")
         self.next_slice_button.clicked.connect(self.next_slice)
         self.next_slice_button.setEnabled(False)
-        self.control_layout.addWidget(self.next_slice_button)
+        slice_buttons_layout.addWidget(self.next_slice_button)
+        
+        slice_nav_layout.addWidget(self.slice_label)
+        slice_nav_layout.addWidget(slice_buttons_widget)
+        
+        self.control_layout.addWidget(slice_nav_widget)
         
         self.main_layout.addWidget(self.control_panel)
 
@@ -99,6 +213,10 @@ class VisuAlignApp(QMainWindow):
         self.slice_cache: dict = {}
         self.slice_cache_order: list = []
         self.max_cache_size: int = 20
+        
+        self.measurement_mode: MeasurementMode = MeasurementMode.NONE
+        self.line_start: Optional[Tuple[float, float]] = None
+        self.temp_line_item: Optional[PlotDataItem] = None
 
         if json_file:
             self.load_data(json_file)
@@ -114,11 +232,7 @@ class VisuAlignApp(QMainWindow):
             with open(json_file, "r") as f:
                 data = json.load(f)
 
-            try:
-                project = load_visualign_project(data)
-            except ValidationError as ve:
-                logging.error(f"Invalid JSON structure: {ve.message}")
-                return
+            project = load_visualign_project(data)
 
             self.project_data = project
             self.json_file_path = json_file
@@ -129,12 +243,20 @@ class VisuAlignApp(QMainWindow):
 
             if self.atlas is None or self.region_labels is None or self.color_map is None:
                 logging.error("Atlas data not loaded")
+                self.info_label.setText("Invalid File Loaded.")
                 return
+            
+            self.atlas_info_label.setText(f"Atlas: {project['target']}")
             
             self.preload_slices()
             self.load_slice(self.current_slice_index)
+            self.info_label.setText("JSON Successfully Loaded.")
+            
+            self.set_reference_button.setEnabled(True)
+            self.erase_measure_button.setEnabled(True)
 
         except Exception as e:
+            self.info_label.setText("Invalid File Loaded.")
             logging.error(f"Failed to load data: {e}")
     
     def preload_slices(self) -> None:
@@ -327,24 +449,64 @@ class VisuAlignApp(QMainWindow):
 
         logging.debug("Displaying composite image")
 
+        # Start camera centered on image
         current_view_range = None
-        try:
-            current_view_range = {
-                'xRange': self.brain_viewbox.viewRange()[0],
-                'yRange': self.brain_viewbox.viewRange()[1]
-            }
-        except Exception:
-            pass
+        current_view_range = {
+            'xRange': self.brain_viewbox.viewRange()[0],
+            'yRange': self.brain_viewbox.viewRange()[1]
+        }
 
-        try:
-            self.brain_viewbox.clear()
-        except Exception:
-            pass
+        self.brain_viewbox.clear()
         
         composite = np.transpose(self.current_slice.composite_image, (1, 0, 2))
         brain_image_item = ImageItem(image=composite)
         self.brain_viewbox.addItem(brain_image_item)
         self.brain_viewbox.setAspectLocked(True)
+        
+        if self.current_slice.reference_line is not None:
+            ref_start, ref_end = self.current_slice.reference_line
+            ref_line = PlotDataItem(
+                [ref_start[0], ref_end[0]], 
+                [ref_start[1], ref_end[1]],
+                pen={'color': 'g', 'width': 3}
+            )
+            self.brain_viewbox.addItem(ref_line)
+            
+            if self.current_slice.reference_size is not None:
+                mid_x = (ref_start[0] + ref_end[0]) / 2
+                mid_y = (ref_start[1] + ref_end[1]) / 2
+                from pyqtgraph import TextItem
+                ref_label = TextItem(
+                    f"{self.current_slice.reference_size:.1f} {self.current_slice.reference_unit}",
+                    color='g',
+                    anchor=(0.5, 0.5)
+                )
+                ref_label.setPos(mid_x, mid_y)
+                self.brain_viewbox.addItem(ref_label)
+        
+        # Draw measurement lines
+        for measurement in self.current_slice.measurement_lines:
+            start = measurement.start
+            end = measurement.end
+            length = measurement.length
+            
+            measure_line = PlotDataItem(
+                [start[0], end[0]], 
+                [start[1], end[1]],
+                pen={'color': 'r', 'width': 2}
+            )
+            self.brain_viewbox.addItem(measure_line)
+            
+            mid_x = (start[0] + end[0]) / 2
+            mid_y = (start[1] + end[1]) / 2
+            from pyqtgraph import TextItem
+            measure_label = TextItem(
+                f"{length:.2f} {self.current_slice.reference_unit}",
+                color='r',
+                anchor=(0.5, 0.5)
+            )
+            measure_label.setPos(mid_x, mid_y)
+            self.brain_viewbox.addItem(measure_label)
         
         if self.first_display:
             self.brain_viewbox.autoRange(padding=0.02)
@@ -361,6 +523,136 @@ class VisuAlignApp(QMainWindow):
         scene = self.brain_viewbox.scene()
         if scene:
             scene.sigMouseMoved.connect(self.on_mouse_move)  # type: ignore
+            scene.sigMouseClicked.connect(self.on_mouse_click)  # type: ignore
+    
+    def on_unit_changed(self, new_unit: str) -> None:
+        """Handle changes to the measurement unit selector."""
+        if self.current_slice is not None and self.current_slice.reference_line is not None:
+            self.current_slice.reference_unit = new_unit
+            self.display_brain()
+    
+    def toggle_reference_mode(self) -> None:
+        """Toggle reference line drawing mode."""
+        if self.set_reference_button.isChecked():
+            self.measurement_mode = MeasurementMode.REFERENCE
+            self.draw_measure_button.setChecked(False)
+            self.erase_measure_button.setChecked(False)
+            self.info_label.setText("Click two points to draw reference line")
+        else:
+            self.measurement_mode = MeasurementMode.NONE
+            self.line_start = None
+            self.clear_temp_line()
+            self.info_label.setText("Hover over atlas to see region names")
+    
+    def toggle_draw_mode(self) -> None:
+        """Toggle measurement line drawing mode."""
+        if self.draw_measure_button.isChecked():
+            self.measurement_mode = MeasurementMode.DRAW
+            self.set_reference_button.setChecked(False)
+            self.erase_measure_button.setChecked(False)
+            self.info_label.setText("Click two points to draw measurement line")
+        else:
+            self.measurement_mode = MeasurementMode.NONE
+            self.line_start = None
+            self.clear_temp_line()
+            self.info_label.setText("Hover over atlas to see region names")
+    
+    def toggle_erase_mode(self) -> None:
+        """Toggle measurement line erasing mode."""
+        if self.erase_measure_button.isChecked():
+            self.measurement_mode = MeasurementMode.ERASE
+            self.set_reference_button.setChecked(False)
+            self.draw_measure_button.setChecked(False)
+            self.info_label.setText("Click on a measurement line to erase it")
+        else:
+            self.measurement_mode = MeasurementMode.NONE
+            self.info_label.setText("Hover over atlas to see region names")
+    
+    def clear_temp_line(self) -> None:
+        """Clear the temporary line being drawn."""
+        if self.temp_line_item is not None:
+            self.brain_viewbox.removeItem(self.temp_line_item)
+            self.temp_line_item = None
+    
+    def on_mouse_click(self, event) -> None:
+        """Handle mouse clicks for measurement drawing."""
+        if self.current_slice is None:
+            return
+        
+        # Get the click position in view coordinates
+        pos = event.scenePos()
+        view_pos = self.brain_viewbox.mapSceneToView(pos)
+        x, y = view_pos.x(), view_pos.y()
+        
+        if self.measurement_mode == MeasurementMode.REFERENCE:
+            self.handle_reference_click(x, y)
+        elif self.measurement_mode == MeasurementMode.DRAW:
+            self.handle_draw_click(x, y)
+        elif self.measurement_mode == MeasurementMode.ERASE:
+            self.handle_erase_click(x, y)
+    
+    def handle_reference_click(self, x: float, y: float) -> None:
+        """Handle clicks in reference line drawing mode."""
+        if self.line_start is None:
+            self.line_start = (x, y)
+            self.info_label.setText("Click second point to complete reference line")
+        else:
+            try:
+                ref_size = float(self.reference_size_input.text())
+                if ref_size <= 0:
+                    self.info_label.setText("Error: Reference size must be positive")
+                    self.line_start = None
+                    return
+            except ValueError:
+                self.info_label.setText("Error: Please enter a valid reference size")
+                self.line_start = None
+                return
+            
+            unit = self.unit_selector.currentText()
+            
+            if self.current_slice is not None:
+                self.current_slice.set_reference_measurement(ref_size, unit)
+                self.current_slice.set_reference_line(self.line_start, (x, y))
+            
+            self.line_start = None
+            self.clear_temp_line()
+            self.set_reference_button.setChecked(False)
+            self.measurement_mode = MeasurementMode.NONE
+            self.info_label.setText(f"Reference line set: {ref_size} {unit}")
+            self.draw_measure_button.setEnabled(True)
+            self.display_brain()
+    
+    def handle_draw_click(self, x: float, y: float) -> None:
+        """Handle clicks in measurement line drawing mode."""
+        if self.current_slice is None:
+            return
+        
+        if self.current_slice.reference_line is None:
+            self.info_label.setText("Error: Please set a reference line first")
+            return
+        
+        if self.line_start is None:
+            self.line_start = (x, y)
+            self.info_label.setText("Click second point to complete measurement line")
+        else:
+            self.current_slice.add_measurement_line(self.line_start, (x, y))
+            self.line_start = None
+            self.clear_temp_line()
+            self.info_label.setText("Measurement line added")
+            self.display_brain()
+    
+    def handle_erase_click(self, x: float, y: float) -> None:
+        """Handle clicks in erase mode."""
+        if self.current_slice is None:
+            return
+        
+        removed = self.current_slice.remove_measurement_line(x, y, threshold=10.0)
+        
+        if removed:
+            self.info_label.setText("Measurement line removed")
+            self.display_brain()
+        else:
+            self.info_label.setText("No measurement line found at that location")
 
     def on_mouse_move(self, pos: QPointF) -> None:
         """Handle mouse movement over the composite image."""
@@ -370,6 +662,21 @@ class VisuAlignApp(QMainWindow):
             return
 
         view_pos = self.brain_viewbox.mapSceneToView(pos)
+        x, y = view_pos.x(), view_pos.y()
+        
+        # Show temporary line while drawing
+        if self.line_start is not None and self.measurement_mode in (MeasurementMode.REFERENCE, MeasurementMode.DRAW):
+            self.clear_temp_line()
+            line_x = [self.line_start[0], x]
+            line_y = [self.line_start[1], y]
+            self.temp_line_item = PlotDataItem(
+                line_x, line_y,
+                pen={'color': 'y', 'width': 2, 'style': Qt.PenStyle.DashLine}
+            )
+            self.brain_viewbox.addItem(self.temp_line_item)
+        
+        if self.measurement_mode != MeasurementMode.NONE:
+            return
         
         # Get atlas data with region IDs (not the RGB version)
         if hasattr(self.current_slice, 'scaled_transformed_slice') and self.current_slice.scaled_transformed_slice is not None:
@@ -385,11 +692,11 @@ class VisuAlignApp(QMainWindow):
             region_id = transformed_slice[x_disp, y_disp]
             if region_id > 0 and region_id in self.region_labels:
                 region_name = self.region_labels[region_id]
-                self.region_label.setText(f"Region: {region_name} (ID: {region_id})")
+                self.info_label.setText(f"Region: {region_name} (ID: {region_id})")
             else:
-                self.region_label.setText("Background region")
+                self.info_label.setText("Background region")
         else:
-            self.region_label.setText("Hover over atlas to see region names")
+            self.info_label.setText("Hover over atlas to see region names")
 
 def run():
     parser = argparse.ArgumentParser(description="VisuAlign Viewer")

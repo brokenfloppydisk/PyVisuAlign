@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 import numpy.typing as npt
 import numpy as np
 import logging
@@ -6,6 +6,7 @@ from scipy.spatial import Delaunay
 from pyvisualign.project_data import VisualignSlice
 from pyvisualign.int32slices import Int32Slices
 from pyvisualign.util import profile
+from pyvisualign.measurement import Measurement
 from PIL import Image, ImageOps
 import os.path
 
@@ -47,6 +48,12 @@ class Slice:
         self.wireframe_rgb: Optional[npt.NDArray[np.uint8]] = None
         self.atlas_visible: Optional[npt.NDArray] = None
         self.wireframe_visible: Optional[npt.NDArray] = None
+        
+        # Measurement feature fields
+        self.reference_size: Optional[float] = None
+        self.reference_unit: str = "μm"
+        self.reference_line: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None
+        self.measurement_lines: List[Measurement] = []
     
     @profile
     def generate_slice(self) -> None:
@@ -297,4 +304,74 @@ class Slice:
             blended = base_pixels * 0.4 + light_blue_repeated * 0.6
             composite[self._wireframe_mask_3d] = blended.astype(np.uint8)
         
+        
         self.composite_image = composite
+
+    def set_reference_measurement(self, size: float, unit: str) -> None:
+        """Set the reference measurement size and unit."""
+        self.reference_size = size
+        self.reference_unit = unit
+    
+    def set_reference_line(self, start: Tuple[float, float], end: Tuple[float, float]) -> None:
+        """Set the reference line for measurement calibration."""
+        self.reference_line = (start, end)
+    
+    def calculate_pixel_distance(self, p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
+        """Calculate the pixel distance between two points."""
+        return np.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
+    
+    def add_measurement_line(self, start: Tuple[float, float], end: Tuple[float, float]) -> None:
+        """Add a measurement line and calculate its length based on the reference."""
+        if self.reference_line is None or self.reference_size is None:
+            logging.warning("Cannot add measurement line: reference not set")
+            return
+        
+        pixel_distance = self.calculate_pixel_distance(start, end)
+        
+        ref_pixel_distance = self.calculate_pixel_distance(
+            self.reference_line[0], self.reference_line[1]
+        )
+        
+        if ref_pixel_distance > 0:
+            length = (pixel_distance / ref_pixel_distance) * self.reference_size
+        else:
+            length = 0.0
+        
+        self.measurement_lines.append(Measurement(
+            start=np.array(start),
+            end=np.array(end),
+            length=length
+        ))
+    
+    def remove_measurement_line(self, x: float, y: float, threshold: float = 10.0) -> bool:
+        """Remove a measurement line near the given point.
+        
+        Returns True if a line was removed, False otherwise.
+        """
+        for i, measurement in enumerate(self.measurement_lines):
+            p = np.array([x, y])
+            p1 = measurement.start
+            p2 = measurement.end
+            
+            line_vec = p2 - p1
+            line_len_sq = np.dot(line_vec, line_vec)
+            
+            if line_len_sq == 0:
+                dist = np.linalg.norm(p - p1)
+            else:
+                # Project point onto line
+                t = np.clip(np.dot(p - p1, line_vec) / line_len_sq, 0.0, 1.0)
+
+                closest = p1 + t * line_vec
+                dist = np.linalg.norm(p - closest)
+            
+            if dist <= threshold:
+                del self.measurement_lines[i]
+                return True
+        
+        return False
+    
+    def clear_all_measurements(self) -> None:
+        """Clear all measurement lines."""
+        self.measurement_lines.clear()
+
