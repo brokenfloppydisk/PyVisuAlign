@@ -225,7 +225,7 @@ class VisuAlignApp(QMainWindow):
             self.load_button.clicked.connect(self.load_data_interactively)
             self.main_layout.addWidget(self.load_button)
 
-    def load_data(self, json_file: str) -> None:
+    def load_data(self, json_file: str) -> bool:
         """Load project data from a VisuAlign JSON file."""
         logging.info(f"Loading JSON file: {json_file}")
         try:
@@ -244,7 +244,7 @@ class VisuAlignApp(QMainWindow):
             if self.atlas is None or self.region_labels is None or self.color_map is None:
                 logging.error("Atlas data not loaded")
                 self.info_label.setText("Invalid File Loaded.")
-                return
+                return False
             
             self.atlas_info_label.setText(f"Atlas: {project['target']}")
             
@@ -254,10 +254,23 @@ class VisuAlignApp(QMainWindow):
             
             self.set_reference_button.setEnabled(True)
             self.erase_measure_button.setEnabled(True)
-
+            return True
         except Exception as e:
             self.info_label.setText("Invalid File Loaded.")
             logging.error(f"Failed to load data: {e}")
+            return False
+    
+    def load_data_interactively(self) -> None:
+        json_path, _ = QFileDialog.getOpenFileName(
+            self, "Select JSON File", "", "JSON Files (*.json)"
+        )
+        if not json_path:
+            logging.warning("No JSON file selected.")
+            return
+
+        if self.load_data(json_path):
+            self.main_layout.removeWidget(self.load_button)
+            self.load_button.deleteLater()
     
     def preload_slices(self) -> None:
         """Preload up to 5 slices at startup for faster navigation."""
@@ -279,7 +292,6 @@ class VisuAlignApp(QMainWindow):
             self.slice_cache_order.append(i)
         
         logging.info(f"Preloading complete: {len(self.slice_cache)} slices cached")
-    
     
     def load_slice(self, slice_index: int) -> None:
         """Load and display a specific slice by index."""
@@ -343,16 +355,6 @@ class VisuAlignApp(QMainWindow):
         """Navigate to the next slice."""
         if self.project_data is not None and self.current_slice_index < len(self.project_data["slices"]) - 1:
             self.load_slice(self.current_slice_index + 1)
-
-    def load_data_interactively(self) -> None:
-        json_path, _ = QFileDialog.getOpenFileName(
-            self, "Select JSON File", "", "JSON Files (*.json)"
-        )
-        if not json_path:
-            logging.warning("No JSON file selected.")
-            return
-
-        self.load_data(json_path)
 
     def load_atlas(self, nifti_file: str) -> None:
         logging.info(f"Loading NIfTI file: {nifti_file}")
