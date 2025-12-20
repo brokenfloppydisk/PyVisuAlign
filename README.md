@@ -69,6 +69,10 @@ python3 main.py
 
 Then select "Load VisuAlign JSON File". Navigate to a VisuAlign project, and select the corresponding `.json` file.
 
+## Attributions
+
+Uses icons from [Iconoir](https://iconoir.com/) and [Google Material](https://fonts.google.com/icons). 
+
 ## License
 
 MIT License

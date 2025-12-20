@@ -4,8 +4,9 @@ import numpy as np
 import logging
 import argparse
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 from enum import Enum
+from pathlib import Path
 
 from PyQt5.QtWidgets import (
     QApplication,
@@ -22,10 +23,20 @@ from PyQt5.QtWidgets import (
     QComboBox,
 )
 from PyQt5.QtCore import QPointF, Qt
-from PyQt5.QtGui import QDoubleValidator
+from PyQt5.QtGui import QDoubleValidator, QIcon
 from pyqtgraph import GraphicsLayoutWidget, ImageItem, ViewBox, PlotDataItem
 
-from pyvisualign.project_data import load_visualign_project, VisualignProject
+from pyvisualign.project_data import (
+    load_visualign_project, 
+    VisualignProject,
+    load_measurement_data,
+    save_measurement_data,
+    create_slice_measurements,
+    MeasurementReferenceLine,
+    MeasurementLine as MeasurementLineDict,
+    SliceMeasurements,
+    PyVisuAlignData
+)
 from pyvisualign.int32slices import Int32Slices
 from pyvisualign.slice import Slice
 from pyvisualign.measurement import Measurement
@@ -37,6 +48,7 @@ class MeasurementMode(Enum):
     ERASE = 3
 
 class VisuAlignApp(QMainWindow):
+    ASSETS_PATH = str(Path(__file__).resolve()) + "/../assets"
     def __init__(self, json_file: Optional[str] = None, debug: bool = False) -> None:
         super().__init__()
         self.setWindowTitle("PyVisuAlign")
@@ -134,7 +146,8 @@ class VisuAlignApp(QMainWindow):
         measurement_bottom_layout.setContentsMargins(0, 0, 0, 0)
         measurement_bottom_layout.setSpacing(5)
         
-        self.set_reference_button = QPushButton("📏")
+        self.set_reference_button = QPushButton('')
+        self.set_reference_button.setIcon(QIcon(f'{self.ASSETS_PATH}/ruler.svg'))
         self.set_reference_button.setToolTip("Draw reference line")
         self.set_reference_button.setMaximumWidth(40)
         self.set_reference_button.setCheckable(True)
@@ -142,7 +155,8 @@ class VisuAlignApp(QMainWindow):
         self.set_reference_button.clicked.connect(self.toggle_reference_mode)
         measurement_bottom_layout.addWidget(self.set_reference_button)
         
-        self.draw_measure_button = QPushButton("✏️")
+        self.draw_measure_button = QPushButton('')
+        self.draw_measure_button.setIcon(QIcon(f'{self.ASSETS_PATH}/pencil.svg'))
         self.draw_measure_button.setToolTip("Draw measurement lines")
         self.draw_measure_button.setMaximumWidth(40)
         self.draw_measure_button.setCheckable(True)
@@ -150,13 +164,24 @@ class VisuAlignApp(QMainWindow):
         self.draw_measure_button.clicked.connect(self.toggle_draw_mode)
         measurement_bottom_layout.addWidget(self.draw_measure_button)
         
-        self.erase_measure_button = QPushButton("🗑️")
+        self.erase_measure_button = QPushButton('')
+        self.erase_measure_button.setIcon(QIcon(f'{self.ASSETS_PATH}/erase.svg'))
         self.erase_measure_button.setToolTip("Erase measurement lines")
         self.erase_measure_button.setMaximumWidth(40)
         self.erase_measure_button.setCheckable(True)
         self.erase_measure_button.setEnabled(False)
         self.erase_measure_button.clicked.connect(self.toggle_erase_mode)
         measurement_bottom_layout.addWidget(self.erase_measure_button)
+
+        self.save_measurements_button = QPushButton('')
+        self.save_measurements_button.setIcon(QIcon(f"{self.ASSETS_PATH}/download-circle.svg"))
+        self.save_measurements_button.setToolTip("Save all measurements to file")
+        self.save_measurements_button.setStyleSheet("background-color: white")
+        self.save_measurements_button.setMaximumWidth(40)
+        self.save_measurements_button.setCheckable(False)
+        self.save_measurements_button.setEnabled(False)
+        self.save_measurements_button.clicked.connect(self.save_measurements)
+        measurement_bottom_layout.addWidget(self.save_measurements_button)
         
         measurement_layout.addWidget(measurement_top_widget)
         measurement_layout.addWidget(measurement_bottom_widget)
@@ -178,12 +203,12 @@ class VisuAlignApp(QMainWindow):
         slice_buttons_layout.setContentsMargins(0, 0, 0, 0)
         slice_buttons_layout.setSpacing(5)
         
-        self.prev_slice_button: QPushButton = QPushButton("◀ Previous Slice")
+        self.prev_slice_button: QPushButton = QPushButton("< Previous Slice")
         self.prev_slice_button.clicked.connect(self.previous_slice)
         self.prev_slice_button.setEnabled(False)
         slice_buttons_layout.addWidget(self.prev_slice_button)
         
-        self.next_slice_button: QPushButton = QPushButton("Next Slice ▶")
+        self.next_slice_button: QPushButton = QPushButton("Next Slice >")
         self.next_slice_button.clicked.connect(self.next_slice)
         self.next_slice_button.setEnabled(False)
         slice_buttons_layout.addWidget(self.next_slice_button)
@@ -210,9 +235,12 @@ class VisuAlignApp(QMainWindow):
         self.project_data: Optional[VisualignProject] = None
         self.current_slice_index: int = 0
         self.json_file_path: Optional[str] = None
-        self.slice_cache: dict = {}
+        self.slice_cache: Dict[int, Slice] = {}
         self.slice_cache_order: list = []
         self.max_cache_size: int = 20
+        self.measurement_data: Optional[PyVisuAlignData] = None
+        self.current_measurements: Dict[str, SliceMeasurements] = {}
+        self.measurements_modified: bool = False
         
         self.measurement_mode: MeasurementMode = MeasurementMode.NONE
         self.line_start: Optional[Tuple[float, float]] = None
@@ -248,12 +276,23 @@ class VisuAlignApp(QMainWindow):
             
             self.atlas_info_label.setText(f"Atlas: {project['target']}")
             
+            self.measurement_data = load_measurement_data(json_file)
+            if self.measurement_data:
+                logging.info(f"Loaded measurement data for {len(self.measurement_data['measurements'])} slices")
+                self.current_measurements = self.measurement_data['measurements'].copy()
+            else:
+                logging.info("No existing measurement data found")
+                self.current_measurements = {}
+            
+            self.measurements_modified = False
+            
             self.preload_slices()
             self.load_slice(self.current_slice_index)
             self.info_label.setText("JSON Successfully Loaded.")
             
             self.set_reference_button.setEnabled(True)
             self.erase_measure_button.setEnabled(True)
+            self.save_measurements_button.setEnabled(False)
             return True
         except Exception as e:
             self.info_label.setText("Invalid File Loaded.")
@@ -328,6 +367,8 @@ class VisuAlignApp(QMainWindow):
         if self.current_slice is None:
             return
         
+        self._load_slice_measurements()
+        
         self.update_slice_navigation()
         self.display_brain()
         if not hasattr(self, '_mouse_tracking_setup'):
@@ -355,6 +396,98 @@ class VisuAlignApp(QMainWindow):
         """Navigate to the next slice."""
         if self.project_data is not None and self.current_slice_index < len(self.project_data["slices"]) - 1:
             self.load_slice(self.current_slice_index + 1)
+
+    def _load_slice_measurements(self) -> None:
+        """Load measurements from the central dictionary into the current slice."""
+        if self.current_slice is None or self.project_data is None:
+            return
+        
+        slice_filename = self.project_data["slices"][self.current_slice_index]["filename"]
+        
+        if slice_filename not in self.current_measurements:
+            return
+        
+        slice_measurements = self.current_measurements[slice_filename]
+        
+        ref = slice_measurements.get('reference_line')
+        if ref is not None:
+            self.current_slice.set_reference_measurement(ref['size'], ref['unit'])
+            start = tuple(ref['start'])
+            end = tuple(ref['end'])
+            self.current_slice.set_reference_line(
+                (start[0], start[1]),
+                (end[0], end[1])
+            )
+            self.draw_measure_button.setEnabled(True)
+        else:
+            self.draw_measure_button.setEnabled(False)
+        
+        for meas in slice_measurements.get('measurement_lines', []):
+            start = tuple(meas['start'])
+            end = tuple(meas['end'])
+            self.current_slice.add_measurement_line(
+                (start[0], start[1]),
+                (end[0], end[1])
+            )
+    
+    def _update_current_slice_measurements(self) -> None:
+        """Update the central measurements dictionary with current slice's measurements."""
+        if self.current_slice is None or self.project_data is None:
+            return
+        
+        slice_filename = self.project_data["slices"][self.current_slice_index]["filename"]
+        
+        ref_line: Optional[MeasurementReferenceLine] = None
+        if self.current_slice.reference_line is not None:
+            ref_start, ref_end = self.current_slice.reference_line
+            ref_line = {
+                'start': [float(ref_start[0]), float(ref_start[1])],
+                'end': [float(ref_end[0]), float(ref_end[1])],
+                'size': float(self.current_slice.reference_size) if self.current_slice.reference_size else 0.0,
+                'unit': self.current_slice.reference_unit,
+                'pixel_distance': float(self.current_slice.calculate_pixel_distance(ref_start, ref_end))
+            }
+        
+        meas_lines: list[MeasurementLineDict] = []
+        for meas in self.current_slice.measurement_lines:
+            meas_lines.append({
+                'start': [float(meas.start[0]), float(meas.start[1])],
+                'end': [float(meas.end[0]), float(meas.end[1])],
+                'length': float(meas.length)
+            })
+        
+        if ref_line or meas_lines:
+            self.current_measurements[slice_filename] = create_slice_measurements(ref_line, meas_lines)
+        elif slice_filename in self.current_measurements:
+            del self.current_measurements[slice_filename]
+        
+        self.measurements_modified = True
+        self.save_measurements_button.setIcon(QIcon(f"{self.ASSETS_PATH}/download-circle-solid.svg"))
+        self.save_measurements_button.setStyleSheet("background-color: red")
+        self.save_measurements_button.setEnabled(True)
+    
+    def save_measurements(self) -> None:
+        """Save all measurements to the sidecar file in slice index order."""
+        if self.json_file_path is None or self.project_data is None:
+            return
+        
+        ordered_measurements: Dict[str, SliceMeasurements] = {}
+        for slice_data in self.project_data["slices"]:
+            slice_filename = slice_data["filename"]
+            if slice_filename in self.current_measurements:
+                ordered_measurements[slice_filename] = self.current_measurements[slice_filename]
+        
+        success = save_measurement_data(self.json_file_path, ordered_measurements)
+        if success:
+            self.measurements_modified = False
+            self.save_measurements_button.setIcon(QIcon(f"{self.ASSETS_PATH}/download-circle.svg"))
+            self.save_measurements_button.setStyleSheet("background-color: white")
+            self.save_measurements_button.setEnabled(False)
+            self.info_label.setText(f"Saved measurements for {len(ordered_measurements)} slices")
+            logging.info(f"Saved measurements for {len(ordered_measurements)} slices")
+        else:
+            self.info_label.setText("Failed to save measurements")
+            logging.error("Failed to save measurement data")
 
     def load_atlas(self, nifti_file: str) -> None:
         logging.info(f"Loading NIfTI file: {nifti_file}")
@@ -623,6 +756,7 @@ class VisuAlignApp(QMainWindow):
             self.info_label.setText(f"Reference line set: {ref_size} {unit}")
             self.draw_measure_button.setEnabled(True)
             self.display_brain()
+            self._update_current_slice_measurements()
     
     def handle_draw_click(self, x: float, y: float) -> None:
         """Handle clicks in measurement line drawing mode."""
@@ -642,6 +776,7 @@ class VisuAlignApp(QMainWindow):
             self.clear_temp_line()
             self.info_label.setText("Measurement line added")
             self.display_brain()
+            self._update_current_slice_measurements()
     
     def handle_erase_click(self, x: float, y: float) -> None:
         """Handle clicks in erase mode."""
@@ -653,6 +788,7 @@ class VisuAlignApp(QMainWindow):
         if removed:
             self.info_label.setText("Measurement line removed")
             self.display_brain()
+            self._update_current_slice_measurements()
         else:
             self.info_label.setText("No measurement line found at that location")
 
