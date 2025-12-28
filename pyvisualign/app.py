@@ -1,5 +1,6 @@
 import sys
 import json
+import csv
 import numpy as np
 import logging
 import argparse
@@ -213,8 +214,13 @@ class VisuAlignApp(QMainWindow):
         self.next_slice_button.setEnabled(False)
         slice_buttons_layout.addWidget(self.next_slice_button)
         
+        self.export_csv_button: QPushButton = QPushButton("Export all slices to CSV")
+        self.export_csv_button.clicked.connect(self.save_region_areas_csv)
+        self.export_csv_button.setEnabled(False)
+        
         slice_nav_layout.addWidget(self.slice_label)
         slice_nav_layout.addWidget(slice_buttons_widget)
+        slice_nav_layout.addWidget(self.export_csv_button)
         
         self.control_layout.addWidget(slice_nav_widget)
         
@@ -293,6 +299,7 @@ class VisuAlignApp(QMainWindow):
             self.set_reference_button.setEnabled(True)
             self.erase_measure_button.setEnabled(True)
             self.save_measurements_button.setEnabled(False)
+            self.export_csv_button.setEnabled(True)
             return True
         except Exception as e:
             self.info_label.setText("Invalid File Loaded.")
@@ -398,7 +405,9 @@ class VisuAlignApp(QMainWindow):
             self.load_slice(self.current_slice_index + 1)
 
     def _load_slice_measurements(self) -> None:
-        """Load measurements from the central dictionary into the current slice."""
+        """Load measurements from the central dictionary into the current slice.
+        Measurements are stored in full resolution and will be converted to display coordinates when needed.
+        """
         if self.current_slice is None or self.project_data is None:
             return
         
@@ -416,7 +425,8 @@ class VisuAlignApp(QMainWindow):
             end = tuple(ref['end'])
             self.current_slice.set_reference_line(
                 (start[0], start[1]),
-                (end[0], end[1])
+                (end[0], end[1]),
+                from_saved=True
             )
             self.draw_measure_button.setEnabled(True)
         else:
@@ -425,10 +435,16 @@ class VisuAlignApp(QMainWindow):
         for meas in slice_measurements.get('measurement_lines', []):
             start = tuple(meas['start'])
             end = tuple(meas['end'])
-            self.current_slice.add_measurement_line(
-                (start[0], start[1]),
-                (end[0], end[1])
-            )
+            # Recalculate length from positions and reference line
+            start_arr = np.array([start[0], start[1]])
+            end_arr = np.array([end[0], end[1]])
+            pixel_distance = np.linalg.norm(end_arr - start_arr)
+            length = pixel_distance * self.current_slice.units_per_pixel if self.current_slice.units_per_pixel > 0 else 0.0
+            self.current_slice.measurement_lines.append(Measurement(
+                start=start_arr,
+                end=end_arr,
+                length=float(length)
+            ))
     
     def _update_current_slice_measurements(self) -> None:
         """Update the central measurements dictionary with current slice's measurements."""
@@ -444,16 +460,14 @@ class VisuAlignApp(QMainWindow):
                 'start': [float(ref_start[0]), float(ref_start[1])],
                 'end': [float(ref_end[0]), float(ref_end[1])],
                 'size': float(self.current_slice.reference_size) if self.current_slice.reference_size else 0.0,
-                'unit': self.current_slice.reference_unit,
-                'pixel_distance': float(self.current_slice.calculate_pixel_distance(ref_start, ref_end))
+                'unit': self.current_slice.reference_unit
             }
         
         meas_lines: list[MeasurementLineDict] = []
         for meas in self.current_slice.measurement_lines:
             meas_lines.append({
                 'start': [float(meas.start[0]), float(meas.start[1])],
-                'end': [float(meas.end[0]), float(meas.end[1])],
-                'length': float(meas.length)
+                'end': [float(meas.end[0]), float(meas.end[1])]
             })
         
         if ref_line or meas_lines:
@@ -467,7 +481,7 @@ class VisuAlignApp(QMainWindow):
         self.save_measurements_button.setEnabled(True)
     
     def save_measurements(self) -> None:
-        """Save all measurements to the sidecar file in slice index order."""
+        """Save all measurements to the sidecar file in slice index order and export region areas to CSV."""
         if self.json_file_path is None or self.project_data is None:
             return
         
@@ -478,16 +492,57 @@ class VisuAlignApp(QMainWindow):
                 ordered_measurements[slice_filename] = self.current_measurements[slice_filename]
         
         success = save_measurement_data(self.json_file_path, ordered_measurements)
+        
         if success:
             self.measurements_modified = False
             self.save_measurements_button.setIcon(QIcon(f"{self.ASSETS_PATH}/download-circle.svg"))
             self.save_measurements_button.setStyleSheet("background-color: white")
             self.save_measurements_button.setEnabled(False)
-            self.info_label.setText(f"Saved measurements for {len(ordered_measurements)} slices")
-            logging.info(f"Saved measurements for {len(ordered_measurements)} slices")
+            self.info_label.setText(f"Saved measurements and region areas for {len(ordered_measurements)} slices")
+            logging.info(f"Saved measurements and region areas for {len(ordered_measurements)} slices")
         else:
             self.info_label.setText("Failed to save measurements")
             logging.error("Failed to save measurement data")
+    
+    def save_region_areas_csv(self) -> None:
+        """Save region area data to CSV file in the same directory as the JSON file."""
+        if (self.json_file_path is None or self.project_data is None or self.current_slice is None
+            or self.atlas is None or self.region_labels is None or self.color_map is None):
+            return
+        
+        json_path = Path(self.json_file_path)
+        csv_path = json_path.parent / f"{json_path.stem}_region_areas.csv"
+        
+        try:
+            with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(['Slice', 'Region ID', 'Region Name', 'Pixel Count', f'Area ({self.current_slice.reference_unit}²)'])
+                
+                for slice_index, slice_data in enumerate(self.project_data["slices"]):
+                    slice_filename = slice_data["filename"]
+
+                    if slice_filename not in self.current_measurements:
+                        continue
+
+                    if self.current_measurements[slice_filename]["reference_line"] is None:
+                        continue
+
+                    if slice_index in self.slice_cache_order:
+                        curr_slice = self.slice_cache[self.slice_cache_order.index(slice_index)]
+                        logging.debug(f"Saving cached slice {slice_index}")
+                    else:
+                        slice_data = self.project_data["slices"][slice_index]
+                        curr_slice = Slice(slice_data, self.atlas, self.region_labels, self.color_map, self.json_file_path)
+                        curr_slice.generate_slice()
+                        logging.debug(f"Loading slice {slice_index}")
+                    
+                    for region_id, region_name, pixel_count, area in curr_slice.get_region_area_data():
+                        writer.writerow([slice_filename, region_id, region_name, pixel_count, f"{area:.4f}"])
+            
+            logging.info(f"Region areas exported to: {csv_path}")
+        
+        except Exception as e:
+            logging.error(f"Failed to save region areas CSV: {e}")
 
     def load_atlas(self, nifti_file: str) -> None:
         logging.info(f"Loading NIfTI file: {nifti_file}")
@@ -598,8 +653,9 @@ class VisuAlignApp(QMainWindow):
         self.brain_viewbox.addItem(brain_image_item)
         self.brain_viewbox.setAspectLocked(True)
         
-        if self.current_slice.reference_line is not None:
-            ref_start, ref_end = self.current_slice.reference_line
+        ref_line_display = self.current_slice.get_reference_line_display()
+        if ref_line_display is not None:
+            ref_start, ref_end = ref_line_display
             ref_line = PlotDataItem(
                 [ref_start[0], ref_end[0]], 
                 [ref_start[1], ref_end[1]],
@@ -619,12 +675,7 @@ class VisuAlignApp(QMainWindow):
                 ref_label.setPos(mid_x, mid_y)
                 self.brain_viewbox.addItem(ref_label)
         
-        # Draw measurement lines
-        for measurement in self.current_slice.measurement_lines:
-            start = measurement.start
-            end = measurement.end
-            length = measurement.length
-            
+        for start, end, length in self.current_slice.get_measurement_lines_display():
             measure_line = PlotDataItem(
                 [start[0], end[0]], 
                 [start[1], end[1]],
@@ -830,7 +881,17 @@ class VisuAlignApp(QMainWindow):
             region_id = transformed_slice[x_disp, y_disp]
             if region_id > 0 and region_id in self.region_labels:
                 region_name = self.region_labels[region_id]
-                self.info_label.setText(f"Region: {region_name} (ID: {region_id})")
+                
+                # Display area if available, otherwise pixel count
+                if self.current_slice.region_areas and region_id in self.current_slice.region_areas:
+                    area = self.current_slice.region_areas[region_id]
+                    unit = self.current_slice.reference_unit
+                    self.info_label.setText(f"Region: {region_name} (ID: {region_id}, Area: {area:.2f} {unit}²)")
+                elif region_id in self.current_slice.region_pixel_counts:
+                    pixel_count = self.current_slice.region_pixel_counts[region_id]
+                    self.info_label.setText(f"Region: {region_name} (ID: {region_id}, Pixels: {pixel_count})")
+                else:
+                    self.info_label.setText(f"Region: {region_name} (ID: {region_id})")
             else:
                 self.info_label.setText("Background region")
         else:

@@ -76,13 +76,11 @@ class MeasurementReferenceLine(TypedDict):
     end: List[float]
     size: float
     unit: str
-    pixel_distance: float
 
 
 class MeasurementLine(TypedDict):
     start: List[float]
     end: List[float]
-    length: float
 
 
 class SliceMeasurements(TypedDict):

@@ -53,7 +53,14 @@ class Slice:
         self.reference_size: Optional[float] = None
         self.reference_unit: str = "μm"
         self.reference_line: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None
+        self.units_per_pixel: float = 0.0
         self.measurement_lines: List[Measurement] = []
+        
+        self.region_pixel_counts: dict[int, int] = {}
+        self.region_areas: dict[int, float] = {}
+        
+        self.scale_x: float = 1.0
+        self.scale_y: float = 1.0
     
     @profile
     def generate_slice(self) -> None:
@@ -77,6 +84,9 @@ class Slice:
         self.colored_transformed_slice = self.apply_color_map(self.transformed_slice)
         self.wireframe_slice = self.generate_wireframe(self.transformed_slice)
         self.create_composite_image(opacity=0.5)
+        
+        # Calculate region pixel counts once when slice is loaded
+        self.region_pixel_counts = self._calculate_region_pixel_counts()
     
     @staticmethod
     @profile
@@ -233,10 +243,12 @@ class Slice:
         
         if (self.colored_transformed_slice.shape[:2] != (expected_height, expected_width)):
             src_h, src_w = self.colored_transformed_slice.shape[:2]
+            self.scale_x = src_w / expected_width
+            self.scale_y = src_h / expected_height
             
-            y_indices = (np.arange(expected_height) * src_h / expected_height).astype(np.int32)
-            x_indices = (np.arange(expected_width) * src_w / expected_width).astype(np.int32)
-            
+            y_indices = (np.arange(expected_height) * self.scale_y).astype(np.int32)
+            x_indices = (np.arange(expected_width) * self.scale_x).astype(np.int32)
+
             y_indices = np.clip(y_indices, 0, src_h - 1)
             x_indices = np.clip(x_indices, 0, src_w - 1)
             
@@ -245,6 +257,7 @@ class Slice:
             self.scaled_transformed_slice = self.transformed_slice[y_indices[:, None], x_indices[None, :]]
             self.scaled_wireframe = self.wireframe_slice[y_indices[:, None], x_indices[None, :]]
         else:
+            self.scale_x, self.scale_y = 1, 1
             self.scaled_atlas = self.colored_transformed_slice
             self.scaled_transformed_slice = self.transformed_slice
             self.scaled_wireframe = self.wireframe_slice
@@ -268,8 +281,6 @@ class Slice:
         """
         if base_image is None:
             base_image = self.color_image
-        if base_image is None:
-            return
         if base_image.ndim == 2:
             base_image = np.stack([base_image] * 3, axis=-1)
         
@@ -307,49 +318,112 @@ class Slice:
         
         self.composite_image = composite
 
+    def _display_to_full_coords(self, x: float, y: float) -> Tuple[float, float]:
+        """Convert display (scaled) coordinates to full resolution coordinates."""
+        return (x * self.scale_x, y * self.scale_y)
+    
+    def _full_to_display_coords(self, x: float, y: float) -> Tuple[float, float]:
+        """Convert full resolution coordinates to display (scaled) coordinates."""
+        return (x / self.scale_x, y / self.scale_y)
+    
     def set_reference_measurement(self, size: float, unit: str) -> None:
         """Set the reference measurement size and unit."""
         self.reference_size = size
         self.reference_unit = unit
     
-    def set_reference_line(self, start: Tuple[float, float], end: Tuple[float, float]) -> None:
-        """Set the reference line for measurement calibration."""
-        self.reference_line = (start, end)
+    def set_reference_line(self, start: Tuple[float, float], end: Tuple[float, float], from_saved: bool = False) -> None:
+        """Set the reference line for measurement calibration.
+        
+        Args:
+            start: Start point coordinates
+            end: End point coordinates
+            from_saved: If True, coordinates are in full resolution (from saved data).
+                       If False, coordinates are in display space (from user clicks).
+        """
+        if from_saved:
+            start_full = start
+            end_full = end
+        else:
+            start_full = self._display_to_full_coords(start[0], start[1])
+            end_full = self._display_to_full_coords(end[0], end[1])
+        
+        self.reference_line = (start_full, end_full)
+        
+        pixel_distance = self.calculate_pixel_distance(start_full, end_full)
+        if pixel_distance > 0 and self.reference_size is not None:
+            self.units_per_pixel = self.reference_size / pixel_distance
+        else:
+            self.units_per_pixel = 0.0
+        
+        self.update_region_areas()
+    
+    def get_reference_line_display(self) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+        """Get the reference line in display coordinates."""
+        if self.reference_line is None:
+            return None
+        
+        start_full, end_full = self.reference_line
+        start_display = self._full_to_display_coords(start_full[0], start_full[1])
+        end_display = self._full_to_display_coords(end_full[0], end_full[1])
+        return (start_display, end_display)
     
     def calculate_pixel_distance(self, p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
         """Calculate the pixel distance between two points."""
         return np.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
     
     def add_measurement_line(self, start: Tuple[float, float], end: Tuple[float, float]) -> None:
-        """Add a measurement line and calculate its length based on the reference."""
+        """Add a measurement line and calculate its length based on the reference.
+        Coordinates are expected in display space and stored in full resolution space.
+        """
         if self.reference_line is None or self.reference_size is None:
             logging.warning("Cannot add measurement line: reference not set")
             return
         
-        pixel_distance = self.calculate_pixel_distance(start, end)
+        start_full = self._display_to_full_coords(start[0], start[1])
+        end_full = self._display_to_full_coords(end[0], end[1])
         
-        ref_pixel_distance = self.calculate_pixel_distance(
-            self.reference_line[0], self.reference_line[1]
-        )
+        pixel_distance = self.calculate_pixel_distance(start_full, end_full)
         
-        if ref_pixel_distance > 0:
-            length = (pixel_distance / ref_pixel_distance) * self.reference_size
+        if self.units_per_pixel > 0:
+            length = pixel_distance * self.units_per_pixel
         else:
             length = 0.0
         
         self.measurement_lines.append(Measurement(
-            start=np.array(start),
-            end=np.array(end),
+            start=np.array(start_full),
+            end=np.array(end_full),
             length=length
         ))
     
+    def get_measurement_lines_display(self) -> List[Tuple[Tuple[float, float], Tuple[float, float], float]]:
+        """Get all measurement lines in display coordinates.
+        
+        Returns:
+            List of tuples: (start_display, end_display, length)
+        """
+        result = []
+        for measurement in self.measurement_lines:
+            start_display = self._full_to_display_coords(
+                measurement.start[0], measurement.start[1]
+            )
+            end_display = self._full_to_display_coords(
+                measurement.end[0], measurement.end[1]
+            )
+            result.append((start_display, end_display, measurement.length))
+        return result
+    
     def remove_measurement_line(self, x: float, y: float, threshold: float = 10.0) -> bool:
         """Remove a measurement line near the given point.
+        Coordinates are expected in display space.
         
         Returns True if a line was removed, False otherwise.
         """
+        x_full, y_full = self._display_to_full_coords(x, y)
+        
+        threshold_full = threshold * self.scale_x
+        
         for i, measurement in enumerate(self.measurement_lines):
-            p = np.array([x, y])
+            p = np.array([x_full, y_full])
             p1 = measurement.start
             p2 = measurement.end
             
@@ -365,7 +439,7 @@ class Slice:
                 closest = p1 + t * line_vec
                 dist = np.linalg.norm(p - closest)
             
-            if dist <= threshold:
+            if dist <= threshold_full:
                 del self.measurement_lines[i]
                 return True
         
@@ -374,4 +448,67 @@ class Slice:
     def clear_all_measurements(self) -> None:
         """Clear all measurement lines."""
         self.measurement_lines.clear()
+    
+    def _calculate_region_pixel_counts(self) -> dict[int, int]:
+        """
+        Calculate the number of pixels for each region in the transformed slice.
+        Uses the full resolution transformed slice (not the scaled display version).
+        This is called once during slice generation.
+        
+        Returns:
+            Dictionary mapping region_id -> pixel_count
+        """
+        if self.transformed_slice is None:
+            return {}
+        
+        unique_regions, counts = np.unique(self.transformed_slice, return_counts=True)
+        
+        region_pixel_counts = {}
+        for region_id, count in zip(unique_regions, counts):
+            if region_id > 0:
+                region_pixel_counts[int(region_id)] = int(count)
+        
+        return region_pixel_counts
+    
+    def update_region_areas(self) -> dict[int, float]:
+        """
+        Calculate the area of each region in the slice using the reference line scale.
+        
+        Returns:
+            Dictionary mapping region_id -> area (in reference_unit^2)
+            Returns empty dict if no reference line is set.
+        """
+        if (self.reference_line is None or self.reference_size is None or 
+            self.transformed_slice is None or self.units_per_pixel == 0):
+            self.region_areas = {}
+            return {}
+        
+        area_per_pixel = self.units_per_pixel ** 2
+        
+        region_areas = {}
+        for region_id, pixel_count in self.region_pixel_counts.items():
+            region_areas[region_id] = pixel_count * area_per_pixel
+        
+        self.region_areas = region_areas
+        return region_areas
+    
+    def get_region_area_data(self) -> List[Tuple[int, str, int, float]]:
+        """
+        Get comprehensive region area data for CSV export.
+        
+        Returns:
+            List of tuples: (region_id, region_name, pixel_count, area)
+            Sorted by region_id
+        """
+        pixel_counts = self.region_pixel_counts
+        
+        data = []
+        for region_id in sorted(pixel_counts.keys()):
+            region_name = self.region_labels.get(region_id, f"Unknown_{region_id}")
+            pixel_count = pixel_counts[region_id]
+            area = self.region_areas.get(region_id, 0.0)
+            data.append((region_id, region_name, pixel_count, area))
+        
+        return data
+
 
