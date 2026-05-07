@@ -63,7 +63,7 @@ class Slice:
         self.scale_y: float = 1.0
     
     @profile
-    def generate_slice(self) -> None:
+    def generate_slice(self, save_atlas_csv: bool = False) -> None:
         """Generate the transformed atlas slice and wireframe overlay."""
         if self.atlas is None or self.slice_data is None:
             logging.warning("Atlas or slice data not loaded.")
@@ -78,9 +78,31 @@ class Slice:
         atlas_slice = self.atlas.get_int32_slice(
             slice_origin, slice_x_axis, slice_y_axis, grayscale=False
         )
-        atlas_slice = np.flipud(atlas_slice)
+        # Save raw atlas slice to CSV for cross-check with VisuAlign output (optional)
+        if save_atlas_csv:
+            try:
+                out_dir = os.path.join(os.getcwd(), "slice_outputs")
+                os.makedirs(out_dir, exist_ok=True)
+                base_name = os.path.splitext(self.slice_data.get("filename", "slice"))[0]
+                raw_path = os.path.join(out_dir, f"{base_name}_atlas_raw.csv")
+                np.savetxt(raw_path, atlas_slice, fmt="%d", delimiter=",")
+                logging.info(f"Saved raw atlas slice CSV: {raw_path}")
+            except Exception:
+                logging.exception("Failed to save raw atlas slice CSV")
 
         self.transformed_slice = self.generate_transformed_atlas(atlas_slice)
+        # Save transformed (post-triangulation) atlas slice for cross-check (optional)
+        if save_atlas_csv:
+            try:
+                out_dir = os.path.join(os.getcwd(), "slice_outputs")
+                os.makedirs(out_dir, exist_ok=True)
+                base_name = os.path.splitext(self.slice_data.get("filename", "slice"))[0]
+                transformed_path = os.path.join(out_dir, f"{base_name}_atlas_transformed.csv")
+                np.savetxt(transformed_path, self.transformed_slice, fmt="%d", delimiter=",")
+                logging.info(f"Saved transformed atlas slice CSV: {transformed_path}")
+            except Exception:
+                logging.exception("Failed to save transformed atlas slice CSV")
+        
         self.colored_transformed_slice = self.apply_color_map(self.transformed_slice)
         self.wireframe_slice = self.generate_wireframe(self.transformed_slice)
         self.create_composite_image(opacity=0.5)
@@ -261,6 +283,10 @@ class Slice:
             self.scaled_atlas = self.colored_transformed_slice
             self.scaled_transformed_slice = self.transformed_slice
             self.scaled_wireframe = self.wireframe_slice
+
+        self.scaled_atlas = np.flipud(self.scaled_atlas)
+        self.scaled_transformed_slice = np.flipud(self.scaled_transformed_slice)
+        self.scaled_wireframe = np.flipud(self.scaled_wireframe)
 
         self.atlas_visible = np.any(self.scaled_atlas > 0, axis=-1)
         self.wireframe_visible = self.scaled_wireframe > 0

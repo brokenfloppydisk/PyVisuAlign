@@ -50,7 +50,7 @@ class MeasurementMode(Enum):
 
 class VisuAlignApp(QMainWindow):
     ASSETS_PATH = str(Path(__file__).resolve()) + "/../assets"
-    def __init__(self, json_file: Optional[str] = None, debug: bool = False) -> None:
+    def __init__(self, json_file: Optional[str] = None, debug: bool = False, save_atlas_csv: bool = False) -> None:
         super().__init__()
         self.setWindowTitle("PyVisuAlign")
         self.setGeometry(100, 100, 1200, 800)
@@ -241,6 +241,7 @@ class VisuAlignApp(QMainWindow):
         self.project_data: Optional[VisualignProject] = None
         self.current_slice_index: int = 0
         self.json_file_path: Optional[str] = None
+        self.save_atlas_csv: bool = save_atlas_csv
         self.slice_cache: Dict[int, Slice] = {}
         self.slice_cache_order: list = []
         self.max_cache_size: int = 20
@@ -333,7 +334,7 @@ class VisuAlignApp(QMainWindow):
         for i in range(slices_to_load):
             slice_data = self.project_data["slices"][i]
             slice_obj = Slice(slice_data, self.atlas, self.region_labels, self.color_map, self.json_file_path)
-            slice_obj.generate_slice()
+            slice_obj.generate_slice(save_atlas_csv=self.save_atlas_csv)
             self.slice_cache[i] = slice_obj
             self.slice_cache_order.append(i)
         
@@ -362,7 +363,7 @@ class VisuAlignApp(QMainWindow):
             logging.debug(f"Creating new slice {slice_index}")
             slice_data = self.project_data["slices"][slice_index]
             self.current_slice = Slice(slice_data, self.atlas, self.region_labels, self.color_map, self.json_file_path)
-            self.current_slice.generate_slice()
+            self.current_slice.generate_slice(save_atlas_csv=self.save_atlas_csv)
             self.slice_cache[slice_index] = self.current_slice
             self.slice_cache_order.append(slice_index)
             
@@ -533,7 +534,7 @@ class VisuAlignApp(QMainWindow):
                     else:
                         slice_data = self.project_data["slices"][slice_index]
                         curr_slice = Slice(slice_data, self.atlas, self.region_labels, self.color_map, self.json_file_path)
-                        curr_slice.generate_slice()
+                        curr_slice.generate_slice(save_atlas_csv=self.save_atlas_csv)
                         logging.debug(f"Loading slice {slice_index}")
                     
                     for region_id, region_name, pixel_count, area in curr_slice.get_region_area_data():
@@ -901,10 +902,12 @@ def run():
     parser = argparse.ArgumentParser(description="VisuAlign Viewer")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--json", type=str, help="Path to the JSON file")
+    parser.add_argument("--save-atlas-csv", action="store_true", dest="save_atlas_csv",
+                        help="Enable saving per-slice CSV outputs to slice_outputs/")
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
-    window = VisuAlignApp(json_file=args.json, debug=args.debug)
+    window = VisuAlignApp(json_file=args.json, debug=args.debug, save_atlas_csv=args.save_atlas_csv)
     window.show()
     sys.exit(app.exec_())
 
