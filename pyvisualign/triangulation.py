@@ -9,21 +9,6 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 
 
-class _Matrix3:
-    def __init__(self, a11, a21, a31, a12, a22, a32, a13, a23, a33):
-        self.m = np.array([[a11, a12, a13], [a21, a22, a23], [a31, a32, a33]], dtype=float)
-
-    def inverse(self) -> Optional["_Matrix3"]:
-        if abs(np.linalg.det(self.m)) < 1e-15:
-            return None
-        inv = np.linalg.inv(self.m)
-        flat = inv.T.flatten()
-        return _Matrix3(*flat)
-
-    def rowmul(self, row: Sequence[float]) -> np.ndarray:
-        return self.m @ np.array(row, dtype=float)
-
-
 class Triangle:
     """Single triangle in display (marker columns 2/3) space with warp to atlas coords."""
 
@@ -39,7 +24,11 @@ class Triangle:
         self.miny = min(ay, by, cy)
         self.maxy = max(ay, by, cy)
         self.A, self.B, self.C = A, B, C
-        self.decomp = _Matrix3(bx - ax, by - ay, 0, cx - ax, cy - ay, 0, ax, ay, 1).inverse()
+        m = np.array([[bx - ax, cx - ax, ax], [by - ay, cy - ay, ay], [0.0, 0.0, 1.0]], dtype=float)
+        if abs(np.linalg.det(m)) < 1e-15:
+            self.decomp = None
+        else:
+            self.decomp = np.linalg.inv(m)
         a2 = (bx - cx) ** 2 + (by - cy) ** 2
         b2 = (ax - cx) ** 2 + (ay - cy) ** 2
         c2 = (ax - bx) ** 2 + (ay - by) ** 2
@@ -59,7 +48,7 @@ class Triangle:
             return None
         if self.decomp is None:
             return None
-        uv1 = self.decomp.rowmul([x, y, 1])
+        uv1 = self.decomp @ np.array([x, y, 1], dtype=float)
         if uv1[0] < 0 or uv1[0] > 1 or uv1[1] < 0 or uv1[1] > 1 or uv1[0] + uv1[1] > 1:
             return None
         return uv1
@@ -141,16 +130,46 @@ def warp_overlay(
     """Backward-map overlay through triangulation (matches VisuAlign export)."""
     h, w = overlay.shape
     out = np.zeros((h, w), dtype=overlay.dtype)
-    for y in range(h):
-        fy = y * slice_height / h
-        for x in range(w):
-            fx = x * slice_width / w
-            for tri in triangles:
-                t = tri.transform(fx, fy)
-                if t is not None:
-                    xx = int(t[0] * w / slice_width)
-                    yy = int(t[1] * h / slice_height)
-                    if 0 <= xx < w and 0 <= yy < h:
-                        out[y, x] = overlay[yy, xx]
-                    break
-    return out
+    # Precompute display-space coordinates for each output pixel and flatten
+    ys, xs = np.indices((h, w))
+    fx = xs * slice_width / w
+    fy = ys * slice_height / h
+    flat_fx = fx.ravel()
+    flat_fy = fy.ravel()
+    out_flat = out.ravel()
+    filled = np.zeros(out_flat.shape, dtype=bool)
+
+    for tri in triangles:
+        if tri.decomp is None:
+            continue
+        # Bounding-box filter to reduce points to test
+        bbox = (flat_fx >= tri.minx) & (flat_fx <= tri.maxx) & (flat_fy >= tri.miny) & (flat_fy <= tri.maxy)
+        to_check = bbox & (~filled)
+        if not np.any(to_check):
+            continue
+        idxs = np.nonzero(to_check)[0]
+        pts = np.vstack((flat_fx[idxs], flat_fy[idxs], np.ones(idxs.shape[0], dtype=float)))
+        uv = tri.decomp @ pts
+        u = uv[0, :]
+        v = uv[1, :]
+        inside = (u >= 0) & (u <= 1) & (v >= 0) & (v <= 1) & (u + v <= 1)
+        if not np.any(inside):
+            continue
+        valid_idxs = idxs[inside]
+        u = u[inside]
+        v = v[inside]
+        A, B, C = tri.A, tri.B, tri.C
+        tx = A[0] + (B[0] - A[0]) * u + (C[0] - A[0]) * v
+        ty = A[1] + (B[1] - A[1]) * u + (C[1] - A[1]) * v
+        src_x = (tx * w / slice_width).astype(np.int64)
+        src_y = (ty * h / slice_height).astype(np.int64)
+        valid_bounds = (src_x >= 0) & (src_x < w) & (src_y >= 0) & (src_y < h)
+        if not np.any(valid_bounds):
+            continue
+        final_idxs = valid_idxs[valid_bounds]
+        sx = src_x[valid_bounds]
+        sy = src_y[valid_bounds]
+        out_flat[final_idxs] = overlay[sy, sx]
+        filled[final_idxs] = True
+
+    return out_flat.reshape(h, w)
