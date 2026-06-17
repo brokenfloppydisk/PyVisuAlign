@@ -2,8 +2,8 @@ from typing import Optional, Tuple, List
 import numpy.typing as npt
 import numpy as np
 import logging
-from scipy.spatial import Delaunay
 from pyvisualign.project_data import VisualignSlice
+from pyvisualign.triangulation import Triangle, triangulate, warp_overlay
 from pyvisualign.int32slices import Int32Slices
 from pyvisualign.util import profile
 from pyvisualign.measurement import Measurement
@@ -16,7 +16,9 @@ class Slice:
         self.slice_data: VisualignSlice = slice_data
         self.markers = np.array(self.slice_data["markers"])
         self.anchoring = np.array(self.slice_data["anchoring"])
-        self.triangulation = self.perform_triangulation(self.markers)
+        self.triangles = self.perform_triangulation(
+            self.markers, self.slice_data["width"], self.slice_data["height"]
+        )
 
         image_path = os.path.dirname(json_file) + "/" + self.slice_data["filename"]
         image = Image.open(image_path)
@@ -156,71 +158,17 @@ class Slice:
     
     @profile
     def generate_transformed_atlas(self, atlas: npt.NDArray) -> npt.NDArray:
-        """Transform the atlas using triangulation to align with the brain image."""
-        if self.triangulation is None:
+        """Transform the atlas using VisuAlign-compatible backward warping."""
+        if self.triangles is None:
             logging.warning("Unable to generate transformed atlas!")
             return np.zeros((100, 100), dtype=atlas.dtype)
 
-        output_height, output_width = atlas.shape[:2]
-        transformed_atlas = np.zeros((output_height, output_width), dtype=atlas.dtype)
-        y_coords, x_coords = np.where(atlas != 0)
-        
-        if len(x_coords) == 0:
-            return transformed_atlas
-        
-        pixel_values = atlas[y_coords, x_coords]
-        points = np.column_stack([x_coords, y_coords])
-        simplex_indices = self.triangulation.find_simplex(points)
-        
-        inside_mask = simplex_indices != -1
-        outside_mask = ~inside_mask
-        
-        # Handle points outside triangulation (identity mapping)
-        if np.any(outside_mask):
-            outside_points = points[outside_mask]
-            outside_values = pixel_values[outside_mask]
-            tx = np.round(outside_points[:, 0]).astype(int)
-            ty = np.round(outside_points[:, 1]).astype(int)
-            valid = (tx >= 0) & (tx < output_width) & (ty >= 0) & (ty < output_height)
-            transformed_atlas[ty[valid], tx[valid]] = outside_values[valid]
-        
-        if np.any(inside_mask):
-            inside_points = points[inside_mask]
-            inside_values = pixel_values[inside_mask]
-            inside_simplices = simplex_indices[inside_mask]
-            
-            vertices = self.triangulation.simplices[inside_simplices]
-            
-            orig_pts = self.markers[vertices, :2]
-            trans_pts = self.markers[vertices, 2:4]
-            
-            # barycentric coordinate computation
-            # For each point, solve: [v0.x v1.x v2.x] [w0]   [p.x]
-            #                        [v0.y v1.y v2.y] [w1] = [p.y]
-            #                        [  1    1    1 ] [w2]   [ 1 ]
-
-            A = np.zeros((len(inside_points), 3, 3))
-            A[:, 0, :] = orig_pts[:, 0, :]
-            A[:, 1, :] = orig_pts[:, 1, :]
-            A[:, 2, :] = orig_pts[:, 2, :]
-            A = A.transpose(0, 2, 1)
-            A[:, 2, :] = 1.0
-            
-            b = np.ones((len(inside_points), 3))
-            b[:, 0] = inside_points[:, 0]
-            b[:, 1] = inside_points[:, 1]
-            
-            bary_coords = np.linalg.solve(A, b)
-            
-            transformed_x = np.sum(bary_coords * trans_pts[:, :, 0], axis=1)
-            transformed_y = np.sum(bary_coords * trans_pts[:, :, 1], axis=1)
-            
-            tx = np.round(transformed_x).astype(int)
-            ty = np.round(transformed_y).astype(int)
-            valid = (tx >= 0) & (tx < output_width) & (ty >= 0) & (ty < output_height)
-            transformed_atlas[ty[valid], tx[valid]] = inside_values[valid]
-
-        return transformed_atlas
+        return warp_overlay(
+            atlas,
+            self.triangles,
+            self.slice_data["width"],
+            self.slice_data["height"],
+        )
 
     @profile
     def load_region_labels(self, labels_file: str) -> None:
@@ -244,11 +192,12 @@ class Slice:
     
     @staticmethod
     @profile
-    def perform_triangulation(markers) -> Optional[Delaunay]:
+    def perform_triangulation(markers, width: float, height: float) -> Optional[list[Triangle]]:
         if markers is None:
             logging.warning("Unable to triangulate!")
             return None
-        return Delaunay(markers[:, 2:4])
+        _, triangles = triangulate(markers, width, height)
+        return triangles
 
     @profile
     def prepare_overlay_data(self) -> None:
