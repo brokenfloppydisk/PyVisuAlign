@@ -50,7 +50,7 @@ class MeasurementMode(Enum):
 
 class VisuAlignApp(QMainWindow):
     ASSETS_PATH = str(Path(__file__).resolve()) + "/../assets"
-    def __init__(self, json_file: Optional[str] = None, debug: bool = False, save_atlas_csv: bool = False) -> None:
+    def __init__(self, json_file: Optional[str] = None, debug: bool = False, save_atlas_csv: bool = False, export_nifti: bool = False) -> None:
         super().__init__()
         self.setWindowTitle("PyVisuAlign")
         self.setGeometry(100, 100, 1200, 800)
@@ -184,6 +184,10 @@ class VisuAlignApp(QMainWindow):
         self.save_measurements_button.clicked.connect(self.save_measurements)
         measurement_bottom_layout.addWidget(self.save_measurements_button)
         
+        self.export_nifti_button: QPushButton = QPushButton("Export Current Slice to NIfTI")
+        self.export_nifti_button.clicked.connect(self.export_current_slice_to_nifti)
+        self.export_nifti_button.setEnabled(False)
+        
         measurement_layout.addWidget(measurement_top_widget)
         measurement_layout.addWidget(measurement_bottom_widget)
         self.control_layout.addWidget(measurement_widget)
@@ -218,9 +222,12 @@ class VisuAlignApp(QMainWindow):
         self.export_csv_button.clicked.connect(self.save_region_areas_csv)
         self.export_csv_button.setEnabled(False)
         
+        self.export_nifti_button.setEnabled(False)
+        
         slice_nav_layout.addWidget(self.slice_label)
         slice_nav_layout.addWidget(slice_buttons_widget)
         slice_nav_layout.addWidget(self.export_csv_button)
+        slice_nav_layout.addWidget(self.export_nifti_button)
         
         self.control_layout.addWidget(slice_nav_widget)
         
@@ -242,6 +249,7 @@ class VisuAlignApp(QMainWindow):
         self.current_slice_index: int = 0
         self.json_file_path: Optional[str] = None
         self.save_atlas_csv: bool = save_atlas_csv
+        self.export_nifti: bool = export_nifti
         self.slice_cache: Dict[int, Slice] = {}
         self.slice_cache_order: list = []
         self.max_cache_size: int = 20
@@ -301,6 +309,7 @@ class VisuAlignApp(QMainWindow):
             self.erase_measure_button.setEnabled(True)
             self.save_measurements_button.setEnabled(False)
             self.export_csv_button.setEnabled(True)
+            self.export_nifti_button.setEnabled(True)
             return True
         except Exception as e:
             self.info_label.setText("Invalid File Loaded.")
@@ -382,6 +391,9 @@ class VisuAlignApp(QMainWindow):
         if not hasattr(self, '_mouse_tracking_setup'):
             self.setup_mouse_tracking()
             self._mouse_tracking_setup = True
+        
+        if self.export_nifti:
+            self.export_current_slice_to_nifti()
 
     def update_slice_navigation(self) -> None:
         """Update the slice navigation buttons and label."""
@@ -898,16 +910,34 @@ class VisuAlignApp(QMainWindow):
         else:
             self.info_label.setText("Hover over atlas to see region names")
 
+    def export_current_slice_to_nifti(self) -> None:
+        """Export the current slice's transformed atlas to a NIfTI-1 file."""
+        if self.current_slice is None or self.json_file_path is None:
+            self.info_label.setText("Error: No slice loaded or JSON file path unknown.")
+            logging.error("Cannot export to NIfTI: current_slice is None or json_file_path is None.")
+            return
+
+        json_path = Path(self.json_file_path)
+        output_dir = str(json_path.parent / "slice_outputs")
+
+        nifti_path = self.current_slice.export_to_nifti(output_dir, case_name=f"case_{self.current_slice_index:03d}")
+
+        if nifti_path:
+            self.info_label.setText(f"Exported current slice to NIfTI: {nifti_path}")
+        else:
+            self.info_label.setText("Failed to export current slice to NIfTI.")
+
 def run():
     parser = argparse.ArgumentParser(description="VisuAlign Viewer")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--json", type=str, help="Path to the JSON file")
     parser.add_argument("--save-atlas-csv", action="store_true", dest="save_atlas_csv",
                         help="Enable saving per-slice CSV outputs to slice_outputs/")
+    parser.add_argument("--export-nifti", action="store_true", help="Automatically export each slice to NIfTI")
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
-    window = VisuAlignApp(json_file=args.json, debug=args.debug, save_atlas_csv=args.save_atlas_csv)
+    window = VisuAlignApp(json_file=args.json, debug=args.debug, save_atlas_csv=args.save_atlas_csv, export_nifti=args.export_nifti)
     window.show()
     sys.exit(app.exec_())
 

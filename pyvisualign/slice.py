@@ -2,6 +2,7 @@ from typing import Optional, Tuple, List
 import numpy.typing as npt
 import numpy as np
 import logging
+import nibabel as nib
 from pyvisualign.project_data import VisualignSlice
 from pyvisualign.triangulation import Triangle, triangulate, warp_overlay
 from pyvisualign.int32slices import Int32Slices
@@ -485,5 +486,49 @@ class Slice:
             data.append((region_id, region_name, pixel_count, area))
         
         return data
+
+    def export_to_nifti(self, output_dir: str, case_name: str="case") -> Optional[str]:
+        """
+        Export the transformed_slice (region IDs) and the origina limage to NifTI files.
+
+        This is meant for nnUnet-exports.
+            - {base_name}_000[0,1,2].nii.gz saves R, G, and B channels of the original image
+            - {base_name}.nii.gz saves the mask data.
+
+        Args:
+            output_dir: The directory where the NIfTI file will be saved.
+
+        Returns:
+            The path to the saved NIfTI file, or None if an error occurred.
+        """
+        if self.scaled_transformed_slice is None:
+            logging.error("Cannot export to NIfTI: transformed_slice is not available.")
+            return None
+
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+
+            for channel in range(3):
+                nifti_image_filename = f"{case_name}_{channel:04d}.nii.gz"
+                nifti_image_path = os.path.join(output_dir, nifti_image_filename)
+
+                channel_data = self.color_image[:, :, channel]
+                channel_3d = channel_data[:, :, np.newaxis] # Add Z=0
+                nifti_img = nib.Nifti2Image(channel_3d, affine=np.eye(4))
+
+                nib.save(nifti_img, nifti_image_path)
+
+            nifti_overlay_filename = f"{case_name}.nii.gz"
+            nifti_overlay_path = os.path.join(output_dir, nifti_overlay_filename)
+
+            overlay = self.scaled_transformed_slice[:, :, np.newaxis]
+            nifti_overlay = nib.Nifti1Image(overlay, affine=np.eye(4))
+
+            nib.save(nifti_overlay, nifti_overlay_path)
+            logging.info(f"Successfully exported NIfTI to {nifti_overlay_path}")
+            return nifti_overlay_path
+        except Exception as e:
+            logging.error(f"Failed to export NIfTI file: {e}")
+            return None
 
 
